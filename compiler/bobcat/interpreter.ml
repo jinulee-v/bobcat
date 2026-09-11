@@ -933,12 +933,13 @@ let decision_id kind pos = kind ^ "@" ^ position_id pos
     positions inserted during surface desugaring. Wildcard expansion gives all
     compiler-generated constructor arms the position of the one written arm,
     so [Hashtbl.replace] folds them back together. *)
-let index_source_branches ctx (root : conc_expr) =
+let index_source_branches ?(definitions = Var.Map.empty) ctx root =
   Hashtbl.clear ctx.ctx_branch_pairs;
   Hashtbl.clear ctx.ctx_binary_origins;
   Hashtbl.clear ctx.ctx_match_origins;
   let decision_by_pair = Hashtbl.create 257 in
   let outcomes_by_decision = Hashtbl.create 257 in
+  let visited_definitions = ref Var.Set.empty in
   let register_outcome decision outcome =
     let pair = decision ^ "/" ^ outcome in
     Hashtbl.replace ctx.ctx_branch_pairs outcome pair;
@@ -949,8 +950,15 @@ let index_source_branches ctx (root : conc_expr) =
     in
     Hashtbl.replace outcomes_by_decision decision (pair :: outcomes)
   in
-  let rec walk current_decision (e : conc_expr) =
+  let rec walk current_decision e =
     match Mark.remove e with
+    | EVar var ->
+      begin match Var.Map.find_opt var definitions with
+      | Some definition when not (Var.Set.mem var !visited_definitions) ->
+        visited_definitions := Var.Set.add var !visited_definitions;
+        walk None definition
+      | _ -> ()
+      end
     | EIfThenElse { cond; etrue; efalse } ->
       walk None cond;
       let decision = decision_id "if" (Expr.pos e) in
@@ -1009,7 +1017,7 @@ let index_source_branches ctx (root : conc_expr) =
     String.length pair >= String.length prefix
     && String.equal prefix (String.sub pair 0 (String.length prefix))
   in
-  let rec outcomes_below decision (e : conc_expr) =
+  let rec outcomes_below decision e =
     match Mark.remove e with
     | EAppOp { op = Tag ((Branching _ | Exception _) as tag), _;
                args = [inner]; _ } ->
@@ -1034,7 +1042,7 @@ let index_source_branches ctx (root : conc_expr) =
         true_outcomes = uniq true_outcomes;
         false_outcomes = uniq false_outcomes }
   in
-  let rec index_default_conditions decision all_outcomes (e : conc_expr) =
+  let rec index_default_conditions decision all_outcomes e =
     match Mark.remove e with
     | EIfThenElse _ | EMatch _ -> ()
     | EDefault { excepts = []; just; cons } ->
@@ -1050,7 +1058,7 @@ let index_source_branches ctx (root : conc_expr) =
         (fun child () -> index_default_conditions decision all_outcomes child)
         e ()
   in
-  let rec index_origins (e : conc_expr) =
+  let rec index_origins e =
     match Mark.remove e with
     | EIfThenElse { cond; etrue; efalse } ->
       let decision = decision_id "if" (Expr.pos e) in
@@ -5332,136 +5340,44 @@ let enumerate_branch_objectives
     |> List.sort_uniq String.compare
   in
   print_json_string_list "BOBCAT_BRANCH_MANIFEST" objectives;
+  Format.pp_print_flush Format.std_formatter ();
   objectives
 
 exception Unsupported_goal of string
 
-let bool_ty pos = TLit TBool, pos
-
-let bool_mark (e : typed Dcalc.Ast.expr) =
-  let pos = Expr.pos e in
-  Typed { pos; ty = bool_ty pos }
-
-let bool_lit_like value (e : typed Dcalc.Ast.expr) : typed Dcalc.Ast.expr =
-  ELit (LBool value), bool_mark e
-
-let if_goal
-    (cond : typed Dcalc.Ast.expr)
-    (etrue : typed Dcalc.Ast.expr)
-    (efalse : typed Dcalc.Ast.expr) : typed Dcalc.Ast.expr =
-  EIfThenElse { cond; etrue; efalse }, bool_mark cond
-
-let typed_scope_of_conc (scope : conc_expr) : typed Dcalc.Ast.expr =
-  let scope = Concrete.delcustom scope in
-  Expr.map_marks
-    ~f:(function
-      | Custom { pos; custom = { ty = Some ty; _ } } -> Typed { pos; ty }
-      | Custom { pos; custom = { ty = None; _ } } ->
-        raise
-          (Unsupported_goal
-             ("missing type at " ^ Pos.to_string_short pos)))
-    scope
-  |> Expr.unbox
-
-let objective_at_tag ctx target tag tagged =
-  match Hashtbl.find_opt ctx.ctx_branch_pairs (outcome_key tag (Expr.pos tagged)) with
-  | Some objective when String.equal objective target -> true
-  | Some _ | None -> false
-
-let rec first_goal ctx target (e : typed Dcalc.Ast.expr) : typed Dcalc.Ast.expr option =
-  let descend children =
-    List.find_map (first_goal ctx target) children
-  in
-  match Mark.remove e with
-  | EAppOp { op = Tag ((Branching _ | Exception _) as tag), _;
-             args = [inner]; _ }
-    when objective_at_tag ctx target tag e ->
-    begin match tag with
-    | Branching _ -> Some (bool_lit_like true e)
-    | Exception _ -> Some inner
-    | _ -> assert false
-    end
-  | EIfThenElse { cond; etrue; efalse } ->
-    begin match first_goal ctx target cond with
-    | Some goal -> Some goal
-    | None ->
-      begin match first_goal ctx target etrue with
-      | Some goal ->
-        Some (if_goal cond goal (bool_lit_like false goal))
-      | None ->
-        Option.map
-          (fun goal -> if_goal cond (bool_lit_like false goal) goal)
-          (first_goal ctx target efalse)
-      end
-    end
-  | EApp { f = (EAbs { binder; _ }, _); args; _ } ->
-    first_goal ctx target (Expr.subst binder args)
-  | EAbs _ -> None
-  | EMatch { name; e = subject; cases } ->
-    begin match first_goal ctx target subject with
-    | Some goal -> Some goal
-    | None ->
-      let found = ref false in
-      let cases =
-        EnumConstructor.Map.mapi
-          (fun _ arm ->
-            match Mark.remove arm with
-            | EAbs { binder; pos; tys } ->
-              let vars, body = Bindlib.unmbind binder in
-              let arm_objective =
-                Hashtbl.find_opt ctx.ctx_branch_pairs
-                  ("branch@" ^ position_id (Expr.pos arm))
-              in
-              let goal =
-                if Option.fold ~none:false
-                     ~some:(String.equal target) arm_objective
-                then Some (bool_lit_like true body)
-                else first_goal ctx target body
-              in
-              let body =
-                match goal with
-                | Some goal -> found := true; goal
-                | None -> bool_lit_like false body
-              in
-              let binder = Expr.bind vars (Expr.box body) |> Bindlib.unbox in
-              EAbs { binder; pos; tys }, Mark.get arm
-            | _ ->
-              raise
-                (Unsupported_goal "a DCalc match arm is not a lambda"))
-          cases
+let expose_entry_scope (program : typed Dcalc.Ast.expr) =
+  let rec expose definitions seen (e : typed Dcalc.Ast.expr) =
+    match Mark.remove e with
+    | EApp { f = (EAbs { binder; _ }, _); args; _ }
+      when Bindlib.mbinder_arity binder = List.length args ->
+      let vars, body = Bindlib.unmbind binder in
+      let definitions =
+        List.fold_left2
+          (fun definitions var definition ->
+            Var.Map.add var definition definitions)
+          definitions (Array.to_list vars) args
       in
-      if !found then Some (EMatch { name; e = subject; cases }, bool_mark e)
-      else None
-    end
-  | EDefault { excepts = []; just; cons } ->
-    begin match first_goal ctx target just with
-    | Some goal -> Some goal
-    | None ->
-      Option.map
-        (fun goal -> if_goal just goal (bool_lit_like false goal))
-        (first_goal ctx target cons)
-    end
-  | EDefault { excepts; just; cons } ->
-    begin match descend excepts with
-    | Some goal -> Some goal
-    | None ->
-      begin match first_goal ctx target just, first_goal ctx target cons with
-      | None, None -> None
-      | Some _, _ | _, Some _ ->
-        raise
-          (Unsupported_goal
-             "ordered defaults with exceptions need a guarded default encoding")
-      end
-    end
-  | EPureDefault inner | EErrorOnEmpty inner -> first_goal ctx target inner
-  | EApp { f; args; _ } -> descend (f :: args)
-  | EAppOp { args; _ } | EArray args | ETuple args -> descend args
-  | EStruct { fields; _ } -> descend (StructField.Map.values fields)
-  | EStructAccess { e; _ } | ETupleAccess { e; _ } | EInj { e; _ }
-  | EAssert e -> first_goal ctx target e
-  | EExternal _ | EVar _ | ELit _ | EEmpty | EPos _ | EFatalError _ | EBad ->
-    None
-  | _ -> None
+      expose definitions seen body
+    | EVar var ->
+      if Var.Set.mem var seen then
+        raise (Unsupported_goal "cyclic top-level definition while locating scope")
+      else
+        begin match Var.Map.find_opt var definitions with
+        | Some definition ->
+          expose definitions (Var.Set.add var seen) definition
+        | None ->
+          raise
+            (Unsupported_goal
+               "unbound top-level variable while locating entry scope")
+        end
+    | EAbs _ -> Var.Map.bindings definitions, e
+    | _ ->
+      raise
+        (Unsupported_goal
+           "the compiled entry scope is not a function after lazy unfolding")
+  in
+  expose Var.Map.empty Var.Set.empty program
+
 
 let print_goal_result objective status fields =
   let json =
@@ -5470,45 +5386,250 @@ let print_goal_result objective status fields =
   in
   Message.result "BOBCAT_OBJECTIVE %s" (Yojson.Safe.to_string json)
 
+let replay_model ctx p scope input =
+  let hits = Hashtbl.create 32 in
+  let on_result original result =
+    match Mark.remove original with
+    | EAppOp { op = Tag ((Branching _ | Exception _) as tag), _; _ } ->
+      let taken =
+        match tag, Mark.remove result with
+        | Branching _, _ -> true
+        | Exception _, ELit (LBool true) -> true
+        | Exception _, _ -> false
+        | _ -> false
+      in
+      if taken then
+        let key = outcome_key tag (Expr.pos original) in
+        Option.iter
+          (fun branch -> Hashtbl.replace hits branch ())
+          (Hashtbl.find_opt ctx.ctx_branch_pairs key)
+    | EApp { f = ((EAbs _, _) as selected_arm); _ } ->
+      (* The concrete interpreter turns a selected match arm into an
+         application of that arm lambda.  Recording its source position also
+         covers compiler-generated matches whose arm has no surviving Tag
+         node (for example `minimum ... or if list empty ...`). *)
+      let key = outcome_key (Branching None) (Expr.pos selected_arm) in
+      Option.iter
+        (fun branch -> Hashtbl.replace hits branch ())
+        (Hashtbl.find_opt ctx.ctx_branch_pairs key)
+    | _ -> ()
+  in
+  try
+    let outputs =
+      Concrete.interpret_program_dcalc ~input ~on_result
+        ~raise_on_error:true ~disable_trace:true p scope
+    in
+    let branches = sorted_table_keys hits in
+    begin
+      let outputs =
+        `Assoc
+          (List.map
+             (fun ((name, _), value) ->
+               name, `String (Format.asprintf "%a" (Print.expr ()) value))
+             outputs)
+      in
+      Ok (branches, outputs)
+    end
+  with
+  | Stack_overflow -> Error "concrete replay exhausted the OCaml stack"
+  | (Runtime.Error _ | Failure _ | Invalid_argument _) as exn ->
+    let backtrace = Printexc.get_backtrace () in
+    Error
+      (Printexc.to_string exn
+       ^ if String.equal backtrace "" then "" else "\n" ^ backtrace)
+
 let solve_branch_objectives
     (max_list_length : int)
     (p : (dcalc, typed) gexpr program)
-    s : unit =
+  s : unit =
   let ctx = make_empty_context p.decl_ctx [] max_list_length |> init_context in
-  let scope_e = simplify_program ctx p s in
-  index_source_branches ctx scope_e;
-  let objectives =
-    Hashtbl.fold (fun _ pair pairs -> pair :: pairs) ctx.ctx_branch_pairs []
-    |> List.sort_uniq String.compare
-  in
-  print_json_string_list "BOBCAT_BRANCH_MANIFEST" objectives;
-  let scope = typed_scope_of_conc scope_e in
-  let body =
-    match Mark.remove scope with
-    | EAbs { binder; _ } ->
-      let _, body = Bindlib.unmbind binder in
-      body
+  (* The inherited concolic engine first evaluated the closed program to
+     precompute a residual scope. On large whole-program inputs that eager
+     beta-reduction duplicates shared definitions exponentially before BOBCat
+     even reaches Z3. A backward engine needs the typed DCalc graph itself: it
+     follows applications on demand and retains the program's binders as
+     sharing points. *)
+  let typed_program_e = Program.to_expr p s |> Expr.unbox in
+  let definitions, typed_scope_e = expose_entry_scope typed_program_e in
+  let input_var, input_ty, body =
+    match Mark.remove typed_scope_e with
+    | EAbs { binder; tys = [input_ty]; _ } ->
+      let vars, body = Bindlib.unmbind binder in
+      if Array.length vars <> 1 then
+        raise (Unsupported_goal "the entry scope does not have one input");
+      vars.(0), input_ty, body
     | _ ->
       raise
         (Unsupported_goal "the compiled entry scope is not a function")
   in
+  let indexed_definitions =
+    List.fold_left
+      (fun env (var, definition) -> Var.Map.add var definition env)
+      Var.Map.empty definitions
+  in
+  let rec largest_literal_list e =
+    let here =
+      match Mark.remove e with EArray values -> List.length values | _ -> 0
+    in
+    Expr.shallow_fold
+      (fun child largest -> max largest (largest_literal_list child))
+      e here
+  in
+  let array_capacity =
+    List.fold_left
+      (fun largest (_, definition) ->
+        max largest (largest_literal_list definition))
+      (max max_list_length (largest_literal_list body)) definitions
+  in
+  index_source_branches ~definitions:indexed_definitions ctx body;
+  let indexed_objectives =
+    Hashtbl.fold (fun _ pair pairs -> pair :: pairs) ctx.ctx_branch_pairs []
+    |> List.sort_uniq String.compare
+  in
+  let solver_session =
+    Verification.Z3backend.create_direct_session p.decl_ctx ~input_var
+      ~input_ty ~max_list_length ~array_capacity
+  in
+  let final_results = Hashtbl.create (List.length indexed_objectives) in
+  let compiled = Hashtbl.create (List.length indexed_objectives) in
+  let objective_of_tag tag pos =
+    Hashtbl.find_opt ctx.ctx_branch_pairs (outcome_key tag pos)
+  in
+  let objectives =
+    Verification.Z3backend.reachable_objectives ~objective_of_tag ~definitions
+      body
+    |> List.sort (fun left right ->
+         let rank objective =
+           if String.starts_with ~prefix:"match@" objective then 0
+           else if String.starts_with ~prefix:"if@" objective then 1
+           else 2
+         in
+         match Int.compare (rank left) (rank right) with
+         | 0 -> String.compare left right
+         | order -> order)
+  in
+  (* Emit the denominator before building potentially expensive Z3 formulas.
+     A process-level budget may stop compilation or solving, but it must never
+     make uncovered source outcomes disappear from the coverage metric. *)
+  print_json_string_list "BOBCAT_BRANCH_MANIFEST" objectives;
+  Format.pp_print_flush Format.std_formatter ();
+  let finalize objective status fields =
+    if not (Hashtbl.mem final_results objective) then begin
+      Hashtbl.replace final_results objective (status, fields);
+      print_goal_result objective status fields;
+      Format.pp_print_flush Format.std_formatter ()
+    end
+  in
+  Printexc.record_backtrace true;
+  begin
+    try
+      Verification.Z3backend.compile_reachability solver_session
+        ~objective_of_tag ~definitions body
+    with Stack_overflow ->
+      raise
+        (Failure
+           ("stack overflow while compiling guarded reachability:\n"
+            ^ Printexc.get_backtrace ()))
+  end;
+  List.iter
+    (fun objective -> Hashtbl.replace compiled objective ())
+    (Verification.Z3backend.compiled_objectives solver_session);
+  List.iter
+    (fun (objective, reason) ->
+      finalize objective "unknown" ["reason", `String reason])
+    (Verification.Z3backend.unknown_objectives solver_session);
   List.iter
     (fun objective ->
-      try
-        match first_goal ctx objective body with
-        | None ->
-          print_goal_result objective "unknown"
-            ["reason", `String "objective tag has no executable guard"]
-        | Some goal ->
-          begin match Verification.Z3backend.solve_goal p.decl_ctx goal with
-          | Sat model ->
-            print_goal_result objective "sat" ["model", `String model]
-          | Unsat -> print_goal_result objective "unsat" []
-          | Unknown reason ->
-            print_goal_result objective "unknown" ["reason", `String reason]
+      if not (Hashtbl.mem compiled objective)
+         && not (Hashtbl.mem final_results objective)
+      then
+        finalize objective "unknown"
+          [ "reason",
+            `String "objective tag has no executable guarded instance" ])
+    objectives;
+  let pending () =
+    List.filter
+      (fun objective ->
+        Hashtbl.mem compiled objective
+        && not (Hashtbl.mem final_results objective))
+      objectives
+  in
+  let max_divergences = max 32 (4 * List.length objectives) in
+  let rec take n = function
+    | _ when n <= 0 -> []
+    | [] -> []
+    | x :: xs -> x :: take (n - 1) xs
+  in
+  let rec cover divergences =
+    match pending () with
+    | [] -> ()
+    | uncovered ->
+      let candidates = take 8 uncovered in
+      if divergences >= max_divergences then
+        List.iter
+          (fun objective ->
+            finalize objective "unknown"
+              [ "reason",
+                `String "concrete replay divergence budget exhausted" ])
+          uncovered
+      else
+        match Verification.Z3backend.solve_uncovered solver_session candidates with
+        | Coverage_unsat ->
+          List.iter
+            (fun objective -> finalize objective "unsat" [])
+            candidates;
+          cover divergences
+        | Coverage_unknown reason ->
+          List.iter
+            (fun objective ->
+              finalize objective "unknown" ["reason", `String reason])
+            candidates;
+          cover divergences
+        | Coverage_sat (model, predicted) ->
+          begin match replay_model ctx p s model with
+          | Error reason ->
+            Verification.Z3backend.block_last_input solver_session;
+            Message.warning "BOBCat rejected symbolic input %s: %s"
+              (Yojson.Safe.to_string model) reason;
+            cover (divergences + 1)
+          | Ok (observed, outputs) ->
+            let newly_covered =
+              List.filter
+                (fun objective ->
+                  List.mem objective observed
+                  && not (Hashtbl.mem final_results objective))
+                objectives
+            in
+            if newly_covered = [] then begin
+              Verification.Z3backend.block_last_input solver_session;
+              cover (divergences + 1)
+            end else begin
+              let json =
+                `Assoc
+                  [ "objectives",
+                    `List (List.map (fun x -> `String x) predicted);
+                    "input", model;
+                    "outputs", outputs;
+                    "branches",
+                    `List (List.map (fun b -> `String b) observed) ]
+              in
+              Message.result "BOBCAT_REPLAY %s"
+                (Yojson.Safe.to_string json);
+              List.iter
+                (fun objective ->
+                  finalize objective "sat"
+                    ["input", model; "validated", `Bool true])
+                newly_covered;
+              cover divergences
+            end
           end
-      with Unsupported_goal reason ->
-        print_goal_result objective "unknown" ["reason", `String reason])
+  in
+  cover 0;
+  List.iter
+    (fun objective ->
+      if not (Hashtbl.mem final_results objective) then
+        finalize objective "unknown"
+          ["reason", `String "objective was not classified"])
     objectives;
   Message.result "BOBCAT_DONE %d" (List.length objectives)
 

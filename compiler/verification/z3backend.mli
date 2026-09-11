@@ -19,8 +19,48 @@
 
 module Io : Io.BackendIO
 
-type direct_result = Sat of string | Unsat | Unknown of string
+type direct_session
 
-val solve_goal : Shared_ast.decl_ctx -> Shared_ast.typed Dcalc.Ast.expr -> direct_result
-(** Solve [goal] itself, rather than its negation as the proof interface does.
-    The returned model is intended for BOBCat input decoding and replay. *)
+type coverage_result =
+  | Coverage_sat of Yojson.Safe.t * string list
+  | Coverage_unsat
+  | Coverage_unknown of string
+
+val create_direct_session :
+  Shared_ast.decl_ctx ->
+  input_var:Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var ->
+  input_ty:Shared_ast.typ ->
+  max_list_length:int ->
+  array_capacity:int ->
+  direct_session
+
+val compile_reachability :
+  direct_session ->
+  objective_of_tag:(Shared_ast.tag -> Catala_utils.Pos.t -> string option) ->
+  definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
+               Shared_ast.typed Dcalc.Ast.expr) list ->
+  Shared_ast.typed Dcalc.Ast.expr ->
+  unit
+(** Encode all executable branch outcomes in one guarded formula. If the same
+    source outcome occurs at several call sites, its reachability formula is
+    the disjunction of those guarded instances. *)
+
+val reachable_objectives :
+  objective_of_tag:(Shared_ast.tag -> Catala_utils.Pos.t -> string option) ->
+  definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
+               Shared_ast.typed Dcalc.Ast.expr) list ->
+  Shared_ast.typed Dcalc.Ast.expr ->
+  string list
+(** Cheap source-objective census over the selected entry point's shared,
+    acyclic definition graph. This runs before formula construction so a
+    solver timeout cannot erase uncovered outcomes from the denominator. *)
+
+val unknown_objectives : direct_session -> (string * string) list
+
+val compiled_objectives : direct_session -> string list
+
+val solve_uncovered : direct_session -> string list -> coverage_result
+
+val block_last_input : direct_session -> unit
+(** Compile each objective once, then ask a single persistent solver for a
+    model reaching any member of the supplied uncovered set. *)

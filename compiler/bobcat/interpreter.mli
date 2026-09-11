@@ -35,9 +35,9 @@ val solve_branch_objectives :
   (Shared_ast.dcalc, Shared_ast.typed) Shared_ast.gexpr Shared_ast.program ->
   Shared_ast.ScopeName.t ->
   unit
-(** Construct a reachability formula for each exact branch outcome and submit
-    that formula directly to Z3. No concrete seed, path prefix, or constraint
-    flipping is involved. *)
+(** Compile exact guarded outcome formulas once, then incrementally solve for
+    the disjunction of the outcomes not yet witnessed by concrete replay. No
+    concrete seed, path prefix, or constraint flipping is involved. *)
 open Bobcat_types
 
 val interpret_program_concolic :

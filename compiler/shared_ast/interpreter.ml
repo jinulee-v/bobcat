@@ -737,20 +737,25 @@ and partially_evaluate_expr_for_assertion_failure_message : type d r.
       Mark.get e )
   | _ -> eval_expr e
 
+let runtime_value_trace_enabled = ref true
+
 let rec evaluate_expr : type d r.
     ?on_expr:(((d, r, yes) interpr_kind, 'm) gexpr -> unit) ->
+    ?on_result:(((d, r, yes) interpr_kind, 'm) gexpr ->
+                ((d, r, yes) interpr_kind, 'm) gexpr -> unit) ->
     decl_ctx ->
     Global.backend_lang ->
     ((d, r, yes) interpr_kind, 't) gexpr ->
     ((d, r, yes) interpr_kind, 't) gexpr =
- fun ?on_expr ctx lang e ->
+ fun ?on_expr ?on_result ctx lang e ->
   let debug_print, e =
     Expr.take_attr e (function DebugPrint { label } -> Some label | _ -> None)
   in
-  let evaluate_expr = evaluate_expr ?on_expr in
+  let evaluate_expr = evaluate_expr ?on_expr ?on_result in
   Option.iter (fun f -> f e) on_expr;
   let m = Mark.get e in
   let pos = Expr.mark_pos m in
+  let result =
   (match debug_print with
     | None -> fun r -> r
     | Some label_opt ->
@@ -838,7 +843,8 @@ let rec evaluate_expr : type d r.
           if Global.options.debug then Format.fprintf ppf ":@ %a" Expr.format e
           else ())
         e1)
-  | EAppOp { op = Tag t, _; args = [e]; _ } when Global.options.trace <> None ->
+  | EAppOp { op = Tag t, _; args = [e]; _ }
+    when Global.options.trace <> None && !runtime_value_trace_enabled ->
     let pos = Expr.pos e in
     let kind = tag_to_runtime t in
     Runtime.with_trace ~embed:(Expr.embed_value ctx) kind
@@ -1003,19 +1009,31 @@ let rec evaluate_expr : type d r.
       "Attempting to evaluate a EBad node which should have been previously \
        filtered."
   | _ -> .
+  in
+  Option.iter (fun callback -> callback e result) on_result;
+  result
 
 let evaluate_expr_trace : type d r.
     ?on_expr:(((d, r, yes) interpr_kind, 'm) gexpr -> unit) ->
+    ?on_result:(((d, r, yes) interpr_kind, 'm) gexpr ->
+                ((d, r, yes) interpr_kind, 'm) gexpr -> unit) ->
     ?disable_trace:bool ->
     decl_ctx ->
     Global.backend_lang ->
     ScopeName.t ->
     ((d, r, yes) interpr_kind, 't) gexpr ->
     ((d, r, yes) interpr_kind, 't) gexpr =
- fun ?on_expr ?(disable_trace = false) ctx lang s e ->
+ fun ?on_expr ?on_result ?(disable_trace = false) ctx lang s e ->
   Fun.protect
     (fun () ->
-      let f () = evaluate_expr ?on_expr ctx lang e in
+      let f () =
+        let previous = !runtime_value_trace_enabled in
+        Fun.protect
+          (fun () ->
+            if disable_trace then runtime_value_trace_enabled := false;
+            evaluate_expr ?on_expr ?on_result ctx lang e)
+          ~finally:(fun () -> runtime_value_trace_enabled := previous)
+      in
       if (not disable_trace) && Global.options.trace <> None then
         let scope_pos = Expr.pos_to_runtime (snd (ScopeName.get_info s)) in
         (* [ScopeCall] tags are defined at call-sites, we must add an
@@ -1041,18 +1059,22 @@ let evaluate_expr_trace : type d r.
 
 let evaluate_expr_safe : type d r.
     ?on_expr:(((d, r, yes) interpr_kind, 'm) gexpr -> unit) ->
+    ?on_result:(((d, r, yes) interpr_kind, 'm) gexpr ->
+                ((d, r, yes) interpr_kind, 'm) gexpr -> unit) ->
     ?disable_trace:bool ->
+    ?raise_on_error:bool ->
     decl_ctx ->
     Global.backend_lang ->
     ScopeName.t ->
     ((d, r, yes) interpr_kind, 't) gexpr ->
     ((d, r, yes) interpr_kind, 't) gexpr =
- fun ?on_expr ?disable_trace ctx lang s e ->
+ fun ?on_expr ?on_result ?disable_trace ?(raise_on_error = false) ctx lang s e ->
   try
-    let r = evaluate_expr_trace ?on_expr ?disable_trace ctx lang s e in
+    let r = evaluate_expr_trace ?on_expr ?on_result ?disable_trace ctx lang s e in
     Message.report_delayed_errors_if_any ();
     r
-  with Runtime.Error (err, rpos, note) ->
+  with (Runtime.Error (err, rpos, note) as exn) ->
+    if raise_on_error then raise exn else
     Message.error
       ~extra_pos:(List.map (fun rp -> "", Expr.runtime_to_pos rp) rpos)
       "@[<v>@[<hov>During evaluation:@ %a.@]%t@]" Format.pp_print_text
@@ -1188,12 +1210,15 @@ let interpret_program_lcalc ?input p s :
        thunked arguments"
 
 (** {1 API} *)
-let interpret_program_dcalc ?input ?on_expr p s :
+let interpret_program_dcalc
+    ?input ?on_expr ?on_result ?(raise_on_error = false)
+    ?(disable_trace = false) p s :
     (Uid.MarkedString.info * ('a, 'm) gexpr) list =
   let ctx = p.decl_ctx in
   let e = Expr.unbox (Program.to_expr p s) in
   match
-    evaluate_expr_safe ?on_expr ~disable_trace:true p.decl_ctx p.lang s
+    evaluate_expr_safe ?on_expr ?on_result ~disable_trace:true ~raise_on_error
+      p.decl_ctx p.lang s
       (addcustom e)
   with
   | (EAbs { tys = [((TStruct s_in, _) as scope_ty)]; _ }, mark_e) as e -> begin
@@ -1219,7 +1244,9 @@ let interpret_program_dcalc ?input ?on_expr p s :
         (Expr.pos e)
     in
     match
-      evaluate_expr_safe ?on_expr ctx p.lang s (Expr.unbox to_interpret)
+      evaluate_expr_safe ?on_expr ?on_result ~disable_trace ~raise_on_error
+        ctx p.lang s
+        (Expr.unbox to_interpret)
     with
     | EStruct { fields; _ }, _ ->
       List.map
@@ -1274,17 +1301,21 @@ let interpret_program_dcalc_with_coverage
   in
   r, coverage
 
-let interpret_program_dcalc ?input p s = interpret_program_dcalc ?input p s
+let interpret_program_dcalc
+    ?input ?on_expr ?on_result ?(raise_on_error = false)
+    ?(disable_trace = false) p s =
+  interpret_program_dcalc ?input ?on_expr ?on_result ~raise_on_error
+    ~disable_trace p s
 
 (* Evaluation may introduce intermediate custom terms ([ECustom], pointers to
    external functions), straying away from the DCalc and LCalc ASTS. [addcustom]
    and [delcustom] are needed to expand and shrink the type of the terms to
    reflect that. *)
-let evaluate_expr ?on_expr ctx lang e =
+let evaluate_expr ?on_expr ?on_result ctx lang e =
   Fun.protect ~finally:Runtime.reset_trace
   @@ fun () ->
   let dummy_scope = ScopeName.fresh [] ("dummy", Pos.void) in
-  evaluate_expr_safe ?on_expr ctx lang dummy_scope (addcustom e)
+  evaluate_expr_safe ?on_expr ?on_result ctx lang dummy_scope (addcustom e)
 
 let loaded_modules = Hashtbl.create 17
 

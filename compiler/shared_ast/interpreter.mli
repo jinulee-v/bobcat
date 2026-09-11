@@ -36,6 +36,8 @@ val evaluate_operator :
 
 val evaluate_expr :
   ?on_expr:((('a, 'b, yes) interpr_kind, 'm) gexpr -> unit) ->
+  ?on_result:((('a, 'b, yes) interpr_kind, 'm) gexpr ->
+              (('a, 'b, yes) interpr_kind, 'm) gexpr -> unit) ->
   decl_ctx ->
   Global.backend_lang ->
   (('a, 'b, _) interpr_kind, 'm) gexpr ->
@@ -45,6 +47,11 @@ val evaluate_expr :
 
 val interpret_program_dcalc :
   ?input:Yojson.Safe.t ->
+  ?on_expr:(((yes, no, yes) interpr_kind, 'm) gexpr -> unit) ->
+  ?on_result:(((yes, no, yes) interpr_kind, 'm) gexpr ->
+              ((yes, no, yes) interpr_kind, 'm) gexpr -> unit) ->
+  ?raise_on_error:bool ->
+  ?disable_trace:bool ->
   (dcalc, 'm) gexpr program ->
   ScopeName.t ->
   (Uid.MarkedString.info * ((yes, no, yes) interpr_kind, 'm) gexpr) list
