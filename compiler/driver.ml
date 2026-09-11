@@ -1480,6 +1480,8 @@ module Commands = struct
     let run
         options
         max_list_length
+        solver_timeout_ms
+        solver_timeout_max_ms
         includes
         stdlib
         optimize
@@ -1497,7 +1499,8 @@ module Commands = struct
         ~hashf:Hash.(finalise ~monomorphize_types:false)
         prg;
       let scope = get_scope_uid prg.decl_ctx ex_scope in
-      Bobcat.Interpreter.solve_branch_objectives max_list_length prg scope
+      Bobcat.Interpreter.solve_branch_objectives max_list_length
+        solver_timeout_ms solver_timeout_max_ms prg scope
     in
     let max_list_length =
       let open Cmdliner.Arg in
@@ -1509,6 +1512,24 @@ module Commands = struct
              represents the length symbolically and does not enumerate list \
              lengths as concolic paths."
     in
+    let solver_timeout_ms =
+      let open Cmdliner.Arg in
+      value
+      & opt int 2000
+      & info ["bobcat-solver-timeout-ms"] ~docv:"MILLISECONDS"
+          ~doc:
+            "Initial per-query Z3 timeout (default: 2000ms). Unknown singleton \
+             objectives are retried with progressively larger timeouts."
+    in
+    let solver_timeout_max_ms =
+      let open Cmdliner.Arg in
+      value
+      & opt int 60000
+      & info ["bobcat-solver-timeout-max-ms"] ~docv:"MILLISECONDS"
+          ~doc:
+            "Maximum per-query Z3 timeout used by progressive UNKNOWN recovery \
+             (default: 60000ms)."
+    in
     Cmd.v
       (Cmd.info "bobcat"
          ~doc:
@@ -1517,6 +1538,8 @@ module Commands = struct
         const run
         $ Cli.Flags.Global.options
         $ max_list_length
+        $ solver_timeout_ms
+        $ solver_timeout_max_ms
         $ Cli.Flags.include_dirs
         $ Cli.Flags.stdlib_dir
         $ Cli.Flags.optimize

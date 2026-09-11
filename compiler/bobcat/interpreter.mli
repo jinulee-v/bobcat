@@ -30,14 +30,16 @@ val enumerate_branch_objectives :
     executing a concrete input or constructing concolic path candidates.  This
     is the front-end census consumed by BOBCat's goal-directed solver. *)
 
+(** Compile exact guarded outcome slices into one shared session, then solve
+    and concretely replay each objective. No concrete seed, path prefix, or
+    constraint flipping is involved. *)
 val solve_branch_objectives :
+  int ->
+  int ->
   int ->
   (Shared_ast.dcalc, Shared_ast.typed) Shared_ast.gexpr Shared_ast.program ->
   Shared_ast.ScopeName.t ->
   unit
-(** Compile exact guarded outcome formulas once, then incrementally solve for
-    the disjunction of the outcomes not yet witnessed by concrete replay. No
-    concrete seed, path prefix, or constraint flipping is involved. *)
 open Bobcat_types
 
 val interpret_program_concolic :

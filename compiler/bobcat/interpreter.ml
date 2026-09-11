@@ -5431,17 +5431,26 @@ let replay_model ctx p scope input =
       Ok (branches, outputs)
     end
   with
-  | Stack_overflow -> Error "concrete replay exhausted the OCaml stack"
+  | Stack_overflow ->
+    Error ("concrete replay exhausted the OCaml stack", sorted_table_keys hits)
   | (Runtime.Error _ | Failure _ | Invalid_argument _) as exn ->
     let backtrace = Printexc.get_backtrace () in
     Error
-      (Printexc.to_string exn
-       ^ if String.equal backtrace "" then "" else "\n" ^ backtrace)
+      ( (Printexc.to_string exn
+         ^ if String.equal backtrace "" then "" else "\n" ^ backtrace),
+        sorted_table_keys hits )
 
 let solve_branch_objectives
     (max_list_length : int)
+    (solver_timeout_ms : int)
+    (solver_timeout_max_ms : int)
     (p : (dcalc, typed) gexpr program)
   s : unit =
+  if solver_timeout_ms <= 0 then
+    Message.error "The initial BOBCat solver timeout must be positive";
+  if solver_timeout_max_ms < solver_timeout_ms then
+    Message.error
+      "The maximum BOBCat solver timeout must be at least the initial timeout";
   let ctx = make_empty_context p.decl_ctx [] max_list_length |> init_context in
   (* The inherited concolic engine first evaluated the closed program to
      precompute a residual scope. On large whole-program inputs that eager
@@ -5488,7 +5497,7 @@ let solve_branch_objectives
   in
   let solver_session =
     Verification.Z3backend.create_direct_session p.decl_ctx ~input_var
-      ~input_ty ~max_list_length ~array_capacity
+      ~input_ty ~max_list_length ~array_capacity ~solver_timeout_ms
   in
   let final_results = Hashtbl.create (List.length indexed_objectives) in
   let compiled = Hashtbl.create (List.length indexed_objectives) in
@@ -5496,15 +5505,30 @@ let solve_branch_objectives
     Hashtbl.find_opt ctx.ctx_branch_pairs (outcome_key tag pos)
   in
   let objectives =
-    Verification.Z3backend.reachable_objectives ~objective_of_tag ~definitions
-      body
+    indexed_objectives
     |> List.sort (fun left right ->
-         let rank objective =
-           if String.starts_with ~prefix:"match@" objective then 0
-           else if String.starts_with ~prefix:"if@" objective then 1
-           else 2
+         let root_file = Pos.get_file (Expr.pos body) in
+         let contains haystack needle =
+           let haystack_length = String.length haystack in
+           let needle_length = String.length needle in
+           let rec loop offset =
+             offset + needle_length <= haystack_length
+             && (String.equal needle
+                   (String.sub haystack offset needle_length)
+                 || loop (offset + 1))
+           in
+           needle_length = 0 || loop 0
          in
-         match Int.compare (rank left) (rank right) with
+         let rank objective =
+           let local = contains objective ("@" ^ root_file ^ ":") in
+           let kind =
+             if String.starts_with ~prefix:"if@" objective then 0
+             else if String.starts_with ~prefix:"default@" objective then 1
+             else 2
+           in
+           (if local then 0 else 1), kind
+         in
+         match compare (rank left) (rank right) with
          | 0 -> String.compare left right
          | order -> order)
   in
@@ -5520,23 +5544,187 @@ let solve_branch_objectives
       Format.pp_print_flush Format.std_formatter ()
     end
   in
+  let pending_from candidates =
+    List.filter
+      (fun objective ->
+        Hashtbl.mem compiled objective
+        && not (Hashtbl.mem final_results objective))
+      candidates
+  in
+  let divergences = ref 0 in
+  let max_divergences = max 32 (4 * List.length objectives) in
+  let replay_and_validate model predicted =
+    Message.debug "BOBCat candidate input: %s" (Yojson.Safe.to_string model);
+    match replay_model ctx p s model with
+    | Error (reason, observed_before_error) ->
+      incr divergences;
+      Verification.Z3backend.block_last_input solver_session;
+      let json =
+        `Assoc
+          [ "input", model;
+            "predicted",
+            `List (List.map (fun x -> `String x) predicted);
+            "observed_before_error",
+            `List (List.map (fun x -> `String x) observed_before_error);
+            "reason", `String reason ]
+      in
+      Message.result "BOBCAT_REFINEMENT %s" (Yojson.Safe.to_string json);
+      Message.warning "BOBCat rejected symbolic input %s: %s"
+        (Yojson.Safe.to_string model) reason;
+      false
+    | Ok (observed, outputs) ->
+      let newly_covered =
+        List.filter
+          (fun objective ->
+            List.mem objective observed
+            && not (Hashtbl.mem final_results objective))
+          objectives
+      in
+      if newly_covered = [] then begin
+        incr divergences;
+        Verification.Z3backend.block_last_input solver_session;
+        let json =
+          `Assoc
+            [ "input", model;
+              "predicted",
+              `List (List.map (fun x -> `String x) predicted);
+              "observed",
+              `List (List.map (fun x -> `String x) observed);
+              "reason", `String "predicted objective was not observed" ]
+        in
+        Message.result "BOBCAT_REFINEMENT %s" (Yojson.Safe.to_string json);
+        false
+      end else begin
+        let json =
+          `Assoc
+            [ "objectives",
+              `List (List.map (fun x -> `String x) predicted);
+              "input", model;
+              "outputs", outputs;
+              "branches",
+              `List (List.map (fun b -> `String b) observed) ]
+        in
+        Message.result "BOBCAT_REPLAY %s" (Yojson.Safe.to_string json);
+        List.iter
+          (fun objective ->
+            finalize objective "sat"
+              ["input", model; "validated", `Bool true])
+          newly_covered;
+        true
+      end
+  in
+  let split values =
+    let left_count = max 1 (List.length values / 2) in
+    let rec take_drop n taken rest =
+      if n = 0 then List.rev taken, rest
+      else match rest with
+        | [] -> List.rev taken, []
+        | value :: tail -> take_drop (n - 1) (value :: taken) tail
+    in
+    take_drop left_count [] values
+  in
+  let max_refinements_per_group = 3 in
+  let rec solve_group
+      ?(refinements = 0) ~finalize_failures timeout_ms candidates =
+    let candidates = pending_from candidates in
+    if candidates = [] || !divergences >= max_divergences then ()
+    else begin
+      Verification.Z3backend.set_solver_timeout solver_session timeout_ms;
+      match Verification.Z3backend.solve_uncovered solver_session candidates with
+      | Coverage_unsat ->
+        if finalize_failures then
+          List.iter (fun objective -> finalize objective "unsat" []) candidates
+      | Coverage_sat (model, predicted) ->
+        let made_progress = replay_and_validate model predicted in
+        let remaining = pending_from candidates in
+        if remaining <> [] && made_progress && (!divergences < max_divergences)
+        then
+          (* A valid replay can cover only part of an OR-batch. A rejected
+             replay adds a counterexample refinement. In both cases the next
+             query is strictly different: an objective disappeared or the
+             exact spurious model was excluded. *)
+          solve_group ~finalize_failures solver_timeout_ms remaining
+        else if remaining <> [] && not made_progress && finalize_failures then
+          if refinements + 1 >= max_refinements_per_group then
+            List.iter
+              (fun objective ->
+                finalize objective "unknown"
+                  [ "reason",
+                    `String
+                      "repeated symbolic/concrete divergence after abstract \
+                       input refinement";
+                    "refinements", `Int (refinements + 1) ])
+              remaining
+          else
+            solve_group ~refinements:(refinements + 1) ~finalize_failures
+              solver_timeout_ms remaining
+      | Coverage_unknown reason ->
+        begin match candidates with
+        | [_] when timeout_ms < solver_timeout_max_ms ->
+          let next_timeout =
+            min solver_timeout_max_ms (max (timeout_ms + 1) (timeout_ms * 5))
+          in
+          solve_group ~finalize_failures next_timeout candidates
+        | [_] ->
+          if finalize_failures then
+            List.iter
+              (fun objective ->
+                finalize objective "unknown"
+                  [ "reason", `String reason;
+                    "timeout_ms", `Int timeout_ms ])
+              candidates
+        | _ ->
+          (* UNKNOWN for A OR B says nothing about A or B individually. Split
+             until the expensive objective is isolated so its siblings still
+             get a definitive result. *)
+          let left, right = split candidates in
+          solve_group ~finalize_failures timeout_ms left;
+          solve_group ~finalize_failures timeout_ms right
+        end
+    end
+  in
+  let streamed = Hashtbl.create (List.length objectives) in
+  let on_objective objective =
+    Hashtbl.replace compiled objective ();
+    if not (Hashtbl.mem streamed objective) then begin
+      Hashtbl.replace streamed objective ();
+      (* Solve a newly available leaf immediately. UNSAT/UNKNOWN is provisional
+         because another dynamic instance of the same source outcome may be
+         discovered later; SAT is already safe after concrete replay. *)
+      solve_group ~finalize_failures:false solver_timeout_ms [objective]
+    end
+  in
   Printexc.record_backtrace true;
-  begin
-    try
-      Verification.Z3backend.compile_reachability solver_session
-        ~objective_of_tag ~definitions body
-    with Stack_overflow ->
-      raise
-        (Failure
-           ("stack overflow while compiling guarded reachability:\n"
-            ^ Printexc.get_backtrace ()))
-  end;
+  List.iter
+    (fun objective ->
+      if not (Hashtbl.mem final_results objective) then begin
+        begin
+          try
+            Verification.Z3backend.compile_objective solver_session
+              ~on_objective ~objective_of_tag ~definitions objective body
+          with
+          | Stack_overflow ->
+            finalize objective "unknown"
+              [ "reason",
+                `String
+                  ("stack overflow while compiling objective slice:\n"
+                   ^ Printexc.get_backtrace ()) ]
+          | (Failure _ | Invalid_argument _ | Z3.Error _) as exn ->
+            finalize objective "unknown"
+              ["reason", `String (Printexc.to_string exn)]
+        end;
+        if Hashtbl.mem compiled objective
+           && not (Hashtbl.mem final_results objective)
+        then solve_group ~finalize_failures:true solver_timeout_ms [objective]
+      end)
+    objectives;
   List.iter
     (fun objective -> Hashtbl.replace compiled objective ())
     (Verification.Z3backend.compiled_objectives solver_session);
   List.iter
     (fun (objective, reason) ->
-      finalize objective "unknown" ["reason", `String reason])
+      if not (Hashtbl.mem compiled objective) then
+        finalize objective "unknown" ["reason", `String reason])
     (Verification.Z3backend.unknown_objectives solver_session);
   List.iter
     (fun objective ->
@@ -5547,84 +5735,30 @@ let solve_branch_objectives
           [ "reason",
             `String "objective tag has no executable guarded instance" ])
     objectives;
-  let pending () =
-    List.filter
-      (fun objective ->
-        Hashtbl.mem compiled objective
-        && not (Hashtbl.mem final_results objective))
-      objectives
-  in
-  let max_divergences = max 32 (4 * List.length objectives) in
   let rec take n = function
     | _ when n <= 0 -> []
     | [] -> []
     | x :: xs -> x :: take (n - 1) xs
   in
-  let rec cover divergences =
-    match pending () with
+  let rec cover () =
+    let uncovered = pending_from objectives in
+    match uncovered with
     | [] -> ()
-    | uncovered ->
+    | _ ->
       let candidates = take 8 uncovered in
-      if divergences >= max_divergences then
+      if !divergences >= max_divergences then
         List.iter
           (fun objective ->
             finalize objective "unknown"
               [ "reason",
                 `String "concrete replay divergence budget exhausted" ])
           uncovered
-      else
-        match Verification.Z3backend.solve_uncovered solver_session candidates with
-        | Coverage_unsat ->
-          List.iter
-            (fun objective -> finalize objective "unsat" [])
-            candidates;
-          cover divergences
-        | Coverage_unknown reason ->
-          List.iter
-            (fun objective ->
-              finalize objective "unknown" ["reason", `String reason])
-            candidates;
-          cover divergences
-        | Coverage_sat (model, predicted) ->
-          begin match replay_model ctx p s model with
-          | Error reason ->
-            Verification.Z3backend.block_last_input solver_session;
-            Message.warning "BOBCat rejected symbolic input %s: %s"
-              (Yojson.Safe.to_string model) reason;
-            cover (divergences + 1)
-          | Ok (observed, outputs) ->
-            let newly_covered =
-              List.filter
-                (fun objective ->
-                  List.mem objective observed
-                  && not (Hashtbl.mem final_results objective))
-                objectives
-            in
-            if newly_covered = [] then begin
-              Verification.Z3backend.block_last_input solver_session;
-              cover (divergences + 1)
-            end else begin
-              let json =
-                `Assoc
-                  [ "objectives",
-                    `List (List.map (fun x -> `String x) predicted);
-                    "input", model;
-                    "outputs", outputs;
-                    "branches",
-                    `List (List.map (fun b -> `String b) observed) ]
-              in
-              Message.result "BOBCAT_REPLAY %s"
-                (Yojson.Safe.to_string json);
-              List.iter
-                (fun objective ->
-                  finalize objective "sat"
-                    ["input", model; "validated", `Bool true])
-                newly_covered;
-              cover divergences
-            end
-          end
+      else begin
+        solve_group ~finalize_failures:true solver_timeout_ms candidates;
+        cover ()
+      end
   in
-  cover 0;
+  cover ();
   List.iter
     (fun objective ->
       if not (Hashtbl.mem final_results objective) then

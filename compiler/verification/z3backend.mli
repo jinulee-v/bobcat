@@ -32,9 +32,13 @@ val create_direct_session :
   input_ty:Shared_ast.typ ->
   max_list_length:int ->
   array_capacity:int ->
+  solver_timeout_ms:int ->
   direct_session
 
+val set_solver_timeout : direct_session -> int -> unit
+
 val compile_reachability :
+  ?on_objective:(string -> unit) ->
   direct_session ->
   objective_of_tag:(Shared_ast.tag -> Catala_utils.Pos.t -> string option) ->
   definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
@@ -55,12 +59,28 @@ val reachable_objectives :
     acyclic definition graph. This runs before formula construction so a
     solver timeout cannot erase uncovered outcomes from the denominator. *)
 
+val compile_objective :
+  ?on_objective:(string -> unit) ->
+  direct_session ->
+  objective_of_tag:(Shared_ast.tag -> Catala_utils.Pos.t -> string option) ->
+  definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
+               Shared_ast.typed Dcalc.Ast.expr) list ->
+  string ->
+  Shared_ast.typed Dcalc.Ast.expr ->
+  unit
+(** Add only the backwards dependency slice for one exact source outcome to
+    the shared guarded solver session. *)
+
 val unknown_objectives : direct_session -> (string * string) list
 
 val compiled_objectives : direct_session -> string list
 
+(** Ask the persistent solver for a model reaching any member of the supplied
+    uncovered set. *)
 val solve_uncovered : direct_session -> string list -> coverage_result
 
+(** Conservatively refine after a failed replay by excluding the Catala-visible
+    input equivalence class. Invisible bounded-list padding and inactive sum
+    payloads are abstracted away, so one concrete counterexample is not retried
+    under a syntactically different Z3 model. *)
 val block_last_input : direct_session -> unit
-(** Compile each objective once, then ask a single persistent solver for a
-    model reaching any member of the supplied uncovered set. *)
