@@ -793,3 +793,23 @@ module Backend = struct
 end
 
 module Io = Io.MakeBackendIO (Backend)
+
+type direct_result = Sat of string | Unsat | Unknown of string
+
+let solve_goal (decl_ctx : decl_ctx) (goal : typed expr) : direct_result =
+  try
+    let ctx = Backend.make_context decl_ctx in
+    let ctx, encoding = translate_expr ctx goal in
+    let solver = Z3.Solver.mk_solver ctx.ctx_z3 None in
+    Z3.Solver.add solver (encoding :: ctx.ctx_z3constraints);
+    match Z3.Solver.check solver [] with
+    | Z3.Solver.SATISFIABLE ->
+      begin match Z3.Solver.get_model solver with
+      | Some model -> Sat (print_model ctx model)
+      | None -> Sat ""
+      end
+    | Z3.Solver.UNSATISFIABLE -> Unsat
+    | Z3.Solver.UNKNOWN -> Unknown (Z3.Solver.get_reason_unknown solver)
+  with
+  | Failure message | Invalid_argument message -> Unknown message
+  | Z3.Error message -> Unknown message

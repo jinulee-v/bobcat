@@ -66,11 +66,20 @@ $ catala Concolic -s A
 ┌─[RESULT]─
 │ . o = 20
 └─
-┌─[WARNING]─
-│
-│  Concolic evaluation found an expression that cannot be encoded (a list or a date). The current
-                           path will be dropped.
-│
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . x_in = 4
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . o = 10
 └─
 ┌─[RESULT]─
 │ 
@@ -107,11 +116,6 @@ $ catala Concolic -s A
 └─
 ┌─[RESULT]─
 │ Concolic interpreter done
-└─
-┌─[WARNING]─
-│
-│  Please note that the concolic execution may be incomplete: it could systematically explore the whole program.
-│
 └─
 ┌─[RESULT]─ A ─
 │ Computation successful!

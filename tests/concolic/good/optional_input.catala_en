@@ -1,0 +1,43 @@
+## Symbolic optional inputs
+
+```catala
+declaration scope OptionalInput:
+  input x content optional of integer
+  output result content integer
+
+scope OptionalInput:
+  definition result equals
+    match x with pattern
+    -- Absent: 0
+    -- Present content n: if n > 0 then 1 else -1
+
+declaration scope OptionalListInput:
+  input xs content list of optional of integer
+  output present_count content integer
+
+scope OptionalListInput:
+  definition present_count equals
+    combine all x among xs in count initially 0 with
+      count + (match x with pattern
+               -- Absent: 0
+               -- Present content n: if n > 0 then 1 else 2)
+
+declaration structure OptionalRecord:
+  data x content optional of integer
+
+declaration scope OptionalStructInput:
+  input record content OptionalRecord
+  output result content integer
+
+scope OptionalStructInput:
+  definition result equals
+    match record.x with pattern
+    -- Absent: 0
+    -- Present content n: if n > 0 then 1 else -1
+
+declaration scope NoInput:
+  output result content boolean
+
+scope NoInput:
+  definition result equals true
+```

@@ -18,3 +18,9 @@
 (** Interfacing with the Z3 SMT solver *)
 
 module Io : Io.BackendIO
+
+type direct_result = Sat of string | Unsat | Unknown of string
+
+val solve_goal : Shared_ast.decl_ctx -> Shared_ast.typed Dcalc.Ast.expr -> direct_result
+(** Solve [goal] itself, rather than its negation as the proof interface does.
+    The returned model is intended for BOBCat input decoding and replay. *)

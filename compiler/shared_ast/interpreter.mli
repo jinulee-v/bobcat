@@ -35,6 +35,7 @@ val evaluate_operator :
     operator. *)
 
 val evaluate_expr :
+  ?on_expr:((('a, 'b, yes) interpr_kind, 'm) gexpr -> unit) ->
   decl_ctx ->
   Global.backend_lang ->
   (('a, 'b, _) interpr_kind, 'm) gexpr ->
@@ -53,6 +54,7 @@ val interpret_program_dcalc :
     the computed values for the scope variables of the executed scope. *)
 
 val interpret_program_dcalc_with_coverage :
+  ?input:Yojson.Safe.t ->
   ?stdlib:Global.raw_file ->
   (dcalc, 'm) gexpr program ->
   ScopeName.t ->

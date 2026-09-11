@@ -25,9 +25,9 @@ module Concrete = Shared_ast.Interpreter
 open Z3_utils
 open Symb_expr
 open Path_constraint
-module Optimizations = Concolic_optimizations
+module Optimizations = Bobcat_optimizations
 module Runtime = Catala_runtime
-open Conc_types
+open Bobcat_types
 
 let set_conc_info
     (type m)
@@ -5317,6 +5317,201 @@ module Stats = struct
 end
 
 (** Main function *)
+let enumerate_branch_objectives
+    (type m)
+    (max_list_length : int)
+    (p : (dcalc, m) gexpr program)
+    s : string list =
+  if max_list_length < 0 then
+    Message.error "The maximum BOBCat list length must be non-negative";
+  let ctx = make_empty_context p.decl_ctx [] max_list_length |> init_context in
+  let scope_e = simplify_program ctx p s in
+  index_source_branches ctx scope_e;
+  let objectives =
+    Hashtbl.fold (fun _ pair pairs -> pair :: pairs) ctx.ctx_branch_pairs []
+    |> List.sort_uniq String.compare
+  in
+  print_json_string_list "BOBCAT_BRANCH_MANIFEST" objectives;
+  objectives
+
+exception Unsupported_goal of string
+
+let bool_ty pos = TLit TBool, pos
+
+let bool_mark (e : typed Dcalc.Ast.expr) =
+  let pos = Expr.pos e in
+  Typed { pos; ty = bool_ty pos }
+
+let bool_lit_like value (e : typed Dcalc.Ast.expr) : typed Dcalc.Ast.expr =
+  ELit (LBool value), bool_mark e
+
+let if_goal
+    (cond : typed Dcalc.Ast.expr)
+    (etrue : typed Dcalc.Ast.expr)
+    (efalse : typed Dcalc.Ast.expr) : typed Dcalc.Ast.expr =
+  EIfThenElse { cond; etrue; efalse }, bool_mark cond
+
+let typed_scope_of_conc (scope : conc_expr) : typed Dcalc.Ast.expr =
+  let scope = Concrete.delcustom scope in
+  Expr.map_marks
+    ~f:(function
+      | Custom { pos; custom = { ty = Some ty; _ } } -> Typed { pos; ty }
+      | Custom { pos; custom = { ty = None; _ } } ->
+        raise
+          (Unsupported_goal
+             ("missing type at " ^ Pos.to_string_short pos)))
+    scope
+  |> Expr.unbox
+
+let objective_at_tag ctx target tag tagged =
+  match Hashtbl.find_opt ctx.ctx_branch_pairs (outcome_key tag (Expr.pos tagged)) with
+  | Some objective when String.equal objective target -> true
+  | Some _ | None -> false
+
+let rec first_goal ctx target (e : typed Dcalc.Ast.expr) : typed Dcalc.Ast.expr option =
+  let descend children =
+    List.find_map (first_goal ctx target) children
+  in
+  match Mark.remove e with
+  | EAppOp { op = Tag ((Branching _ | Exception _) as tag), _;
+             args = [inner]; _ }
+    when objective_at_tag ctx target tag e ->
+    begin match tag with
+    | Branching _ -> Some (bool_lit_like true e)
+    | Exception _ -> Some inner
+    | _ -> assert false
+    end
+  | EIfThenElse { cond; etrue; efalse } ->
+    begin match first_goal ctx target cond with
+    | Some goal -> Some goal
+    | None ->
+      begin match first_goal ctx target etrue with
+      | Some goal ->
+        Some (if_goal cond goal (bool_lit_like false goal))
+      | None ->
+        Option.map
+          (fun goal -> if_goal cond (bool_lit_like false goal) goal)
+          (first_goal ctx target efalse)
+      end
+    end
+  | EApp { f = (EAbs { binder; _ }, _); args; _ } ->
+    first_goal ctx target (Expr.subst binder args)
+  | EAbs _ -> None
+  | EMatch { name; e = subject; cases } ->
+    begin match first_goal ctx target subject with
+    | Some goal -> Some goal
+    | None ->
+      let found = ref false in
+      let cases =
+        EnumConstructor.Map.mapi
+          (fun _ arm ->
+            match Mark.remove arm with
+            | EAbs { binder; pos; tys } ->
+              let vars, body = Bindlib.unmbind binder in
+              let arm_objective =
+                Hashtbl.find_opt ctx.ctx_branch_pairs
+                  ("branch@" ^ position_id (Expr.pos arm))
+              in
+              let goal =
+                if Option.fold ~none:false
+                     ~some:(String.equal target) arm_objective
+                then Some (bool_lit_like true body)
+                else first_goal ctx target body
+              in
+              let body =
+                match goal with
+                | Some goal -> found := true; goal
+                | None -> bool_lit_like false body
+              in
+              let binder = Expr.bind vars (Expr.box body) |> Bindlib.unbox in
+              EAbs { binder; pos; tys }, Mark.get arm
+            | _ ->
+              raise
+                (Unsupported_goal "a DCalc match arm is not a lambda"))
+          cases
+      in
+      if !found then Some (EMatch { name; e = subject; cases }, bool_mark e)
+      else None
+    end
+  | EDefault { excepts = []; just; cons } ->
+    begin match first_goal ctx target just with
+    | Some goal -> Some goal
+    | None ->
+      Option.map
+        (fun goal -> if_goal just goal (bool_lit_like false goal))
+        (first_goal ctx target cons)
+    end
+  | EDefault { excepts; just; cons } ->
+    begin match descend excepts with
+    | Some goal -> Some goal
+    | None ->
+      begin match first_goal ctx target just, first_goal ctx target cons with
+      | None, None -> None
+      | Some _, _ | _, Some _ ->
+        raise
+          (Unsupported_goal
+             "ordered defaults with exceptions need a guarded default encoding")
+      end
+    end
+  | EPureDefault inner | EErrorOnEmpty inner -> first_goal ctx target inner
+  | EApp { f; args; _ } -> descend (f :: args)
+  | EAppOp { args; _ } | EArray args | ETuple args -> descend args
+  | EStruct { fields; _ } -> descend (StructField.Map.values fields)
+  | EStructAccess { e; _ } | ETupleAccess { e; _ } | EInj { e; _ }
+  | EAssert e -> first_goal ctx target e
+  | EExternal _ | EVar _ | ELit _ | EEmpty | EPos _ | EFatalError _ | EBad ->
+    None
+  | _ -> None
+
+let print_goal_result objective status fields =
+  let json =
+    `Assoc
+      (("objective", `String objective) :: ("status", `String status) :: fields)
+  in
+  Message.result "BOBCAT_OBJECTIVE %s" (Yojson.Safe.to_string json)
+
+let solve_branch_objectives
+    (max_list_length : int)
+    (p : (dcalc, typed) gexpr program)
+    s : unit =
+  let ctx = make_empty_context p.decl_ctx [] max_list_length |> init_context in
+  let scope_e = simplify_program ctx p s in
+  index_source_branches ctx scope_e;
+  let objectives =
+    Hashtbl.fold (fun _ pair pairs -> pair :: pairs) ctx.ctx_branch_pairs []
+    |> List.sort_uniq String.compare
+  in
+  print_json_string_list "BOBCAT_BRANCH_MANIFEST" objectives;
+  let scope = typed_scope_of_conc scope_e in
+  let body =
+    match Mark.remove scope with
+    | EAbs { binder; _ } ->
+      let _, body = Bindlib.unmbind binder in
+      body
+    | _ ->
+      raise
+        (Unsupported_goal "the compiled entry scope is not a function")
+  in
+  List.iter
+    (fun objective ->
+      try
+        match first_goal ctx objective body with
+        | None ->
+          print_goal_result objective "unknown"
+            ["reason", `String "objective tag has no executable guard"]
+        | Some goal ->
+          begin match Verification.Z3backend.solve_goal p.decl_ctx goal with
+          | Sat model ->
+            print_goal_result objective "sat" ["model", `String model]
+          | Unsat -> print_goal_result objective "unsat" []
+          | Unknown reason ->
+            print_goal_result objective "unknown" ["reason", `String reason]
+          end
+      with Unsupported_goal reason ->
+        print_goal_result objective "unknown" ["reason", `String reason])
+    objectives;
+  Message.result "BOBCAT_DONE %d" (List.length objectives)
+
 let interpret_program_concolic
     (type m)
     (print_stats : bool)

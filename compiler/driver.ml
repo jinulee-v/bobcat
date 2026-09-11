@@ -819,8 +819,8 @@ module Commands = struct
           if code_coverage then
             let interp () =
               let res, cov =
-                Interpreter.interpret_program_dcalc_with_coverage ?stdlib prg
-                  scope
+                Interpreter.interpret_program_dcalc_with_coverage ?stdlib
+                  ?input:scope_input prg scope
               in
               res, Some cov
             in
@@ -1374,11 +1374,20 @@ module Commands = struct
       stats
       conc_optims
       mutation_seed
+      conc_max_list_length
+      conc_code_coverage
+      conc_coverage_priority_burst
       includes
       stdlib
       optimize
       check_invariants
       ex_scope =
+    if conc_code_coverage && Global.options.trace = None then
+      (* Source branch IDs are derived from the trace tags inserted by
+         desugaring. The concolic interpreter consumes these tags itself, so
+         the formatter is intentionally private and produces no user trace. *)
+      ignore
+        (Global.enforce_options ~trace:(Some (lazy (Format.str_formatter))) ());
     let prg, _ =
       Passes.dcalc options ~includes ~stdlib ~optimize ~check_invariants
         ~autotest:false ~typed
@@ -1389,7 +1398,8 @@ module Commands = struct
     let scope = get_scope_uid prg.decl_ctx ex_scope in
     let evaluate () =
       ( Concolic.Interpreter.interpret_program_concolic stats conc_optims
-          mutation_seed prg scope,
+          mutation_seed conc_max_list_length conc_code_coverage
+          conc_coverage_priority_burst prg scope,
         None )
     in
     let success =
@@ -1422,6 +1432,32 @@ module Commands = struct
       & opt (some int) None
       & info ["seed"] ~docv:"SEED" ~doc:"Concolic mutation seed."
     in
+    let conc_max_list_length =
+      let open Cmdliner.Arg in
+      value
+      & opt int 3
+      & info ["conc-max-list-length"] ~docv:"LENGTH"
+          ~doc:
+            "Maximum length of list inputs explored by concolic execution."
+    in
+    let conc_code_coverage =
+      let open Cmdliner.Arg in
+      value
+      & flag
+      & info ["conc-code-coverage"]
+          ~doc:
+            "Record exact source branch outcomes and use them to direct \
+             concolic search."
+    in
+    let conc_coverage_priority_burst =
+      let open Cmdliner.Arg in
+      value
+      & opt int 3
+      & info ["conc-coverage-priority-burst"] ~docv:"COUNT"
+          ~doc:
+            "Select COUNT uncovered-outcome candidates before one ordinary \
+             DFS candidate (default: 3; 0 selects pure DFS)."
+    in
     Cmd.v
       (Cmd.info "concolic" ~doc:"Runs the concolic interpreter")
       Term.(
@@ -1431,6 +1467,56 @@ module Commands = struct
         $ stats
         $ conc_optims
         $ mutation_seed
+        $ conc_max_list_length
+        $ conc_code_coverage
+        $ conc_coverage_priority_burst
+        $ Cli.Flags.include_dirs
+        $ Cli.Flags.stdlib_dir
+        $ Cli.Flags.optimize
+        $ Cli.Flags.check_invariants
+        $ Cli.Flags.ex_scope)
+
+  let bobcat_cmd =
+    let run
+        options
+        max_list_length
+        includes
+        stdlib
+        optimize
+        check_invariants
+        ex_scope =
+      if Global.options.trace = None then
+        ignore
+          (Global.enforce_options
+             ~trace:(Some (lazy (Format.str_formatter))) ());
+      let prg, _ =
+        Passes.dcalc options ~includes ~stdlib ~optimize ~check_invariants
+          ~autotest:false ~typed:Expr.typed
+      in
+      Interpreter.load_runtime_modules
+        ~hashf:Hash.(finalise ~monomorphize_types:false)
+        prg;
+      let scope = get_scope_uid prg.decl_ctx ex_scope in
+      Bobcat.Interpreter.solve_branch_objectives max_list_length prg scope
+    in
+    let max_list_length =
+      let open Cmdliner.Arg in
+      value
+      & opt int 5
+      & info ["bobcat-max-list-length"] ~docv:"LENGTH"
+          ~doc:
+            "Bound used to encode symbolic list inputs (default: 5). BOBCat \
+             represents the length symbolically and does not enumerate list \
+             lengths as concolic paths."
+    in
+    Cmd.v
+      (Cmd.info "bobcat"
+         ~doc:
+           "Runs BOBCat's branch-objective backward symbolic executor")
+      Term.(
+        const run
+        $ Cli.Flags.Global.options
+        $ max_list_length
         $ Cli.Flags.include_dirs
         $ Cli.Flags.stdlib_dir
         $ Cli.Flags.optimize
@@ -1458,6 +1544,7 @@ module Commands = struct
       pygmentize_cmd;
       json_schema_cmd;
       concolic_cmd;
+      bobcat_cmd;
     ]
 end
 

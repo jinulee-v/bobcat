@@ -387,8 +387,16 @@ let digit = [%sedlex.regexp? '0' .. '9']
 (** Regexp matching at least one space. *)
 let space_plus = [%sedlex.regexp? Plus white_space]
 
-(** characters that can be present in idents (excluding first char) *)
-let idchar = [%sedlex.regexp? uppercase | lowercase | digit | '_' | '\'']
+(** Characters that can be present in identifiers (excluding the first
+    character).  [xid_continue] includes Unicode letters, combining marks,
+    decimal digits, and connector punctuation (including [_]). *)
+let idchar = [%sedlex.regexp? xid_continue | '\'']
+
+(** Unicode identifier-start characters without a case, such as CJK
+    ideographs.  They follow the lowercase-identifier path because Catala uses
+    the first character's case to distinguish variables from constructors. *)
+let cased_idstart = [%sedlex.regexp? uppercase | lowercase]
+let uncased_idstart = [%sedlex.regexp? Sub (xid_start, cased_idstart)]
 
 (** Regexp matching white space but not newlines *)
 let hspace = [%sedlex.regexp? Sub (white_space, Chars "\n\r")]
@@ -815,6 +823,10 @@ let rec lex_code (lexbuf : lexbuf) : token =
       UIDENT (Utf8.lexeme lexbuf)
   | lowercase, Star idchar ->
       (* Name of variable *)
+      L.update_acc lexbuf;
+      LIDENT (Utf8.lexeme lexbuf)
+  | uncased_idstart, Star idchar ->
+      (* Variable name in a script without uppercase/lowercase distinctions. *)
       L.update_acc lexbuf;
       LIDENT (Utf8.lexeme lexbuf)
   | Opt '-', Plus digit ->

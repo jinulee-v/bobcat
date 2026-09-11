@@ -1,0 +1,183 @@
+## Concolic representations that are introduced inside an evaluated program
+
+```catala
+declaration scope ConcreteList:
+  input upper content integer
+  output length content integer
+
+scope ConcreteList:
+  definition length equals number of (List.sequence of 0, upper)
+
+declaration scope TupleProjection:
+  input x content integer
+  output sign content integer
+
+scope TupleProjection:
+  definition sign equals
+    let pair equals (x, x + 1) in if pair.1 > 0 then 1 else 0
+
+declaration scope PolymorphicOptional:
+  input x content optional of integer
+  output result content optional of integer
+
+scope PolymorphicOptional:
+  definition result equals
+    combine all item among [x; Present content 1]
+      in accumulator initially Absent
+      with match item with pattern
+           -- Absent: accumulator
+           -- Present content value: Present content value
+
+declaration scope NthElement:
+  input values content list of integer
+  input index content integer
+  output result content integer
+
+scope NthElement:
+  definition result equals
+    match (List.nth_element of values, index) with pattern
+    -- Absent: -1
+    -- Present content value: value
+
+declaration scope NthSelector:
+  input index content integer
+  output is_second content boolean
+
+scope NthSelector:
+  definition is_second equals
+    match (List.nth_element of [10; 20; 30], index) with pattern
+    -- Absent: false
+    -- Present content value: if value = 20 then true else false
+
+declaration scope RemoveNth:
+  input values content list of integer
+  input index content integer
+  output result content list of integer
+
+scope RemoveNth:
+  definition result equals List.remove_nth_element of values, index
+
+declaration scope Reverse:
+  input values content list of integer
+  output result content list of integer
+
+scope Reverse:
+  definition result equals List.reverse of values
+
+declaration scope Reduce:
+  input values content list of integer
+  output result content integer
+
+scope Reduce:
+  definition result equals maximum of values or if list empty then -1
+
+declaration scope DecimalRound:
+  input value content decimal
+  input precision content integer
+  output result content decimal
+
+scope DecimalRound:
+  definition result equals
+    Decimal.round_to_decimal of value, precision
+
+declaration scope MoneyRound:
+  input value content money
+  input precision content integer
+  output result content money
+
+scope MoneyRound:
+  definition result equals
+    Money.round_to_decimal of value, precision
+
+declaration scope DateParts:
+  input value content date
+  output year_value content integer
+  output month_value content integer
+  output day_value content integer
+
+scope DateParts:
+  definition year_value equals Date.get_year of value
+  definition month_value equals Date.get_month of value
+  definition day_value equals Date.get_day of value
+
+declaration scope DateDuration:
+  input value content date
+  input delta content duration
+  output down_value content date
+  output up_value content date
+
+scope DateDuration:
+  definition down_value equals Date.add_round_down of value, delta
+  definition up_value equals Date.add_round_up of value, delta
+
+declaration scope DateBranch:
+  input value content date
+  output selected content integer
+
+scope DateBranch:
+  definition selected equals if Date.get_year of value = 1962 then 1 else 0
+
+declaration scope CalendarLiteral:
+  output leap_year content date
+  output month_end_down content date
+  output month_end_up content date
+
+scope CalendarLiteral:
+  definition leap_year equals Date.add_round_down of |2000-02-29|, 1 year
+  definition month_end_down equals Date.add_round_down of |2026-05-31|, 1 month
+  definition month_end_up equals Date.add_round_up of |2026-05-31|, 1 month
+
+declaration scope DateConstructor:
+  input year_value content integer
+  input month_value content integer
+  input day_value content integer
+  output result content date
+
+scope DateConstructor:
+  definition result equals
+    Date.of_year_month_day of year_value, month_value, day_value
+
+declaration scope SplitPeriod:
+  input start_date content date
+  input stop_date content date
+  input starting_month content Date.Month
+  output month_count content integer
+  output year_count content integer
+
+scope SplitPeriod:
+  definition month_count equals
+    number of (Period.split_by_month of Period {
+      -- begin: start_date
+      -- end: stop_date
+    })
+  definition year_count equals
+    number of (Period.split_by_year of starting_month, Period {
+      -- begin: start_date
+      -- end: stop_date
+    })
+
+declaration scope SortPeriod:
+  input first_date content date
+  input second_date content date
+  output first_payload content integer
+
+scope SortPeriod:
+  definition first_payload equals
+    let sorted equals Period.sort_by_date of [
+      (Period { -- begin: first_date -- end: first_date }, 1);
+      (Period { -- begin: second_date -- end: second_date }, 2)
+    ] in
+    match (List.first_element of sorted) with pattern
+    -- Absent: 0
+    -- Present content entry: entry.2
+
+declaration scope DayOfWeek:
+  input value content date
+  output is_sunday content boolean
+
+scope DayOfWeek:
+  definition is_sunday equals
+    match (Date.day_of_week of value) with pattern
+    -- Sunday: true
+    -- anything: false
+```

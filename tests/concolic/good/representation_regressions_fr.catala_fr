@@ -1,0 +1,11 @@
+# Régression des fonctions de calendrier importées
+
+```catala
+déclaration champ d'application DateBranche:
+  entrée valeur contenu date
+  résultat sélectionné contenu entier
+
+champ d'application DateBranche:
+  définition sélectionné égal à
+    si Date.accès_année de valeur = 1962 alors 1 sinon 0
+```

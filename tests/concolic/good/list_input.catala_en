@@ -1,0 +1,423 @@
+## Symbolic list inputs
+
+```catala
+declaration scope ListInput:
+  input xs content list of integer
+  output length content integer
+  output positive_count content integer
+  output total content integer
+
+scope ListInput:
+  definition length equals number of xs
+  definition positive_count equals
+    number of (list of x among xs such that x > 0)
+  definition total equals
+    combine all x among xs in acc initially 0 with acc + x
+```
+
+```catala-test-cli
+$ catala Concolic --conc-max-list-length=3 -s ListInput
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = []
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 0
+└─
+┌─[RESULT]─
+│ . positive_count = 0
+└─
+┌─[RESULT]─
+│ . total = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 1
+└─
+┌─[RESULT]─
+│ . positive_count = 0
+└─
+┌─[RESULT]─
+│ . total = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 1
+└─
+┌─[RESULT]─
+│ . positive_count = 1
+└─
+┌─[RESULT]─
+│ . total = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0; 0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 2
+└─
+┌─[RESULT]─
+│ . positive_count = 0
+└─
+┌─[RESULT]─
+│ . total = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0; 1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 2
+└─
+┌─[RESULT]─
+│ . positive_count = 1
+└─
+┌─[RESULT]─
+│ . total = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1; 0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 2
+└─
+┌─[RESULT]─
+│ . positive_count = 1
+└─
+┌─[RESULT]─
+│ . total = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1; 1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 2
+└─
+┌─[RESULT]─
+│ . positive_count = 2
+└─
+┌─[RESULT]─
+│ . total = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0; 0; 0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 0
+└─
+┌─[RESULT]─
+│ . total = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0; 0; 1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 1
+└─
+┌─[RESULT]─
+│ . total = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0; 1; 0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 1
+└─
+┌─[RESULT]─
+│ . total = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0; 1; 1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 2
+└─
+┌─[RESULT]─
+│ . total = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1; 0; 0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 1
+└─
+┌─[RESULT]─
+│ . total = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1; 0; 1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 2
+└─
+┌─[RESULT]─
+│ . total = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1; 1; 0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 2
+└─
+┌─[RESULT]─
+│ . total = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1; 1; 1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 3
+└─
+┌─[RESULT]─
+│ . positive_count = 3
+└─
+┌─[RESULT]─
+│ . total = 3
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Concolic interpreter done
+└─
+┌─[RESULT]─ ListInput ─
+│ Computation successful!
+└─
+```
+
+The driver bound is configurable; reducing it to one prevents any longer list
+from being materialised.
+
+```catala-test-cli
+$ catala Concolic --conc-max-list-length=1 -s ListInput
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = []
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 0
+└─
+┌─[RESULT]─
+│ . positive_count = 0
+└─
+┌─[RESULT]─
+│ . total = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [0]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 1
+└─
+┌─[RESULT]─
+│ . positive_count = 0
+└─
+┌─[RESULT]─
+│ . total = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . xs_in = [1]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 1
+└─
+┌─[RESULT]─
+│ . positive_count = 1
+└─
+┌─[RESULT]─
+│ . total = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Concolic interpreter done
+└─
+┌─[RESULT]─ ListInput ─
+│ Computation successful!
+└─
+```

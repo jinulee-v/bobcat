@@ -1,7 +1,7 @@
 (library
  (name verification)
  (public_name catala-proof.verification)
- (libraries catala.driver z3))
+ (libraries catala_utils shared_ast dcalc z3))
 
 (documentation
  (package catala-proof)

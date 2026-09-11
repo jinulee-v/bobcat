@@ -19,8 +19,26 @@
 
 open Catala_utils
 open Shared_ast
-module Optimizations = Concolic_optimizations
-open Conc_types
+module Optimizations = Bobcat_optimizations
+
+val enumerate_branch_objectives :
+  int ->
+  (Shared_ast.dcalc, 'm) Shared_ast.gexpr Shared_ast.program ->
+  Shared_ast.ScopeName.t ->
+  string list
+(** Compile a scope and enumerate its exact source branch outcomes without
+    executing a concrete input or constructing concolic path candidates.  This
+    is the front-end census consumed by BOBCat's goal-directed solver. *)
+
+val solve_branch_objectives :
+  int ->
+  (Shared_ast.dcalc, Shared_ast.typed) Shared_ast.gexpr Shared_ast.program ->
+  Shared_ast.ScopeName.t ->
+  unit
+(** Construct a reachability formula for each exact branch outcome and submit
+    that formula directly to Z3. No concrete seed, path prefix, or constraint
+    flipping is involved. *)
+open Bobcat_types
 
 val interpret_program_concolic :
   bool ->

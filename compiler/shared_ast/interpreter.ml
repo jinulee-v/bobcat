@@ -1236,6 +1236,7 @@ let interpret_program_dcalc ?input ?on_expr p s :
        thunked arguments"
 
 let interpret_program_dcalc_with_coverage
+    ?input
     ?(stdlib : Global.raw_file option)
     (p : (dcalc, 'm) gexpr program)
     scope :
@@ -1254,7 +1255,7 @@ let interpret_program_dcalc_with_coverage
          later on *)
     | _ -> coverage_map := Coverage.reached_pos (Expr.pos e) scope !coverage_map
   in
-  let r = interpret_program_dcalc ~on_expr p scope in
+  let r = interpret_program_dcalc ?input ~on_expr p scope in
   Option.iter
     (fun (stdlib_dir : Global.raw_file) ->
       let stdlib_dir = Global.options.path_rewrite stdlib_dir in
@@ -1279,11 +1280,11 @@ let interpret_program_dcalc ?input p s = interpret_program_dcalc ?input p s
    external functions), straying away from the DCalc and LCalc ASTS. [addcustom]
    and [delcustom] are needed to expand and shrink the type of the terms to
    reflect that. *)
-let evaluate_expr ctx lang e =
+let evaluate_expr ?on_expr ctx lang e =
   Fun.protect ~finally:Runtime.reset_trace
   @@ fun () ->
   let dummy_scope = ScopeName.fresh [] ("dummy", Pos.void) in
-  evaluate_expr_safe ctx lang dummy_scope (addcustom e)
+  evaluate_expr_safe ?on_expr ctx lang dummy_scope (addcustom e)
 
 let loaded_modules = Hashtbl.create 17
 

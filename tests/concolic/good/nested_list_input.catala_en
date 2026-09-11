@@ -1,0 +1,329 @@
+## Nested symbolic list inputs
+
+```catala
+declaration structure Box:
+  data values content list of integer
+
+declaration scope NestedListInput:
+  input box content Box
+  output length content integer
+
+scope NestedListInput:
+  definition length equals number of box.values
+
+declaration scope ListOfListsInput:
+  input values content list of list of integer
+  output outer_length content integer
+  output flattened_length content integer
+
+scope ListOfListsInput:
+  definition outer_length equals number of values
+  definition flattened_length equals
+    number of (combine all inner among values in acc initially []
+               with acc ++ inner)
+```
+
+```catala-test-cli
+$ catala Concolic --conc-max-list-length=2 -s NestedListInput
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . box_in = { Box values = []; }
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . box_in = { Box values = [0]; }
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . box_in = { Box values = [0; 0]; }
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Concolic interpreter done
+└─
+┌─[RESULT]─ NestedListInput ─
+│ Computation successful!
+└─
+```
+
+```catala-test-cli
+$ catala Concolic --conc-max-list-length=2 -s ListOfListsInput
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = []
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 0
+└─
+┌─[RESULT]─
+│ . outer_length = 0
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 0
+└─
+┌─[RESULT]─
+│ . outer_length = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 1
+└─
+┌─[RESULT]─
+│ . outer_length = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0; 0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 2
+└─
+┌─[RESULT]─
+│ . outer_length = 1
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[]; []]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 0
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[]; [0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 1
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[]; [0; 0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 2
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0]; []]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 1
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0]; [0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 2
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0]; [0; 0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 3
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0; 0]; []]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 2
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0; 0]; [0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 3
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Evaluating with inputs:
+└─
+┌─[RESULT]─
+│ . values_in = [[0; 0]; [0; 0]]
+└─
+┌─[RESULT]─
+│ Output of scope after evaluation:
+└─
+┌─[RESULT]─
+│ . flattened_length = 4
+└─
+┌─[RESULT]─
+│ . outer_length = 2
+└─
+┌─[RESULT]─
+│ 
+└─
+┌─[RESULT]─
+│ Concolic interpreter done
+└─
+┌─[RESULT]─ ListOfListsInput ─
+│ Computation successful!
+└─
+```

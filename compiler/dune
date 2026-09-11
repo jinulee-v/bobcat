@@ -11,6 +11,7 @@
   lcalc
   scalc
   concolic
+  bobcat
   catala.runtime_ocaml)
  (modules plugin driver))
 
