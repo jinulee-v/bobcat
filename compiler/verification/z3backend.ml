@@ -3117,7 +3117,9 @@ let compile_reachability
 
 let compile_objective
     ?(on_objective = fun _ -> ())
+    ?(on_timing = fun _ _ -> ())
     session ~objective_of_tag ~definitions objective body =
+  let selection_started = Sys.time () in
   Message.debug "BOBCat: selecting backward slice for %s" objective;
   let definitions =
     List.fold_left
@@ -3240,6 +3242,7 @@ let compile_objective
   Message.debug "BOBCat: selected candidate slice root %s for %s"
     (Pos.to_string_short (typed_expr_pos slice_root)) objective;
   ignore (contains Var.Set.empty slice_root);
+  on_timing "slice_selection" (Sys.time () -. selection_started);
   Message.debug "BOBCat: indexed backward slice for %s" objective;
   let should_visit e =
     List.exists (fun selected -> selected == e) !selected_nodes
@@ -3256,8 +3259,11 @@ let compile_objective
   Queue.clear session.direct_deferred_definitions;
   Hashtbl.clear session.direct_compiled_definition_guards;
   session.direct_on_objective <- on_objective;
+  let compilation_started = Sys.time () in
   Fun.protect
-    ~finally:(fun () -> session.direct_on_objective <- (fun _ -> ()))
+    ~finally:(fun () ->
+      on_timing "slice_compilation" (Sys.time () -. compilation_started);
+      session.direct_on_objective <- (fun _ -> ()))
     (fun () ->
       compile_reach_expr ~should_visit session objective_of_tag definitions
         entry slice_root;

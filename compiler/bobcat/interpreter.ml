@@ -5444,6 +5444,7 @@ let solve_branch_objectives
     (max_list_length : int)
     (solver_timeout_ms : int)
     (solver_timeout_max_ms : int)
+    (print_timings : bool)
     (p : (dcalc, typed) gexpr program)
   s : unit =
   if solver_timeout_ms <= 0 then
@@ -5451,6 +5452,25 @@ let solve_branch_objectives
   if solver_timeout_max_ms < solver_timeout_ms then
     Message.error
       "The maximum BOBCat solver timeout must be at least the initial timeout";
+  let emit_timing phase objectives cpu_seconds =
+    if print_timings then begin
+      let json =
+        `Assoc
+          [ "phase", `String phase;
+            "objectives", `List (List.map (fun x -> `String x) objectives);
+            "cpu_ms", `Float (cpu_seconds *. 1000.) ]
+      in
+      Message.result "BOBCAT_TIMING %s" (Yojson.Safe.to_string json);
+      Format.pp_print_flush Format.std_formatter ()
+    end
+  in
+  let timed phase objectives action =
+    let started = Sys.time () in
+    Fun.protect
+      ~finally:(fun () ->
+        emit_timing phase objectives (Sys.time () -. started))
+      action
+  in
   let ctx = make_empty_context p.decl_ctx [] max_list_length |> init_context in
   (* The inherited concolic engine first evaluated the closed program to
      precompute a residual scope. On large whole-program inputs that eager
@@ -5490,7 +5510,8 @@ let solve_branch_objectives
         max largest (largest_literal_list definition))
       (max max_list_length (largest_literal_list body)) definitions
   in
-  index_source_branches ~definitions:indexed_definitions ctx body;
+  timed "manifest_index" [] (fun () ->
+    index_source_branches ~definitions:indexed_definitions ctx body);
   let indexed_objectives =
     Hashtbl.fold (fun _ pair pairs -> pair :: pairs) ctx.ctx_branch_pairs []
     |> List.sort_uniq String.compare
@@ -5555,7 +5576,7 @@ let solve_branch_objectives
   let max_divergences = max 32 (4 * List.length objectives) in
   let replay_and_validate model predicted =
     Message.debug "BOBCat candidate input: %s" (Yojson.Safe.to_string model);
-    match replay_model ctx p s model with
+    match timed "concrete_replay" predicted (fun () -> replay_model ctx p s model) with
     | Error (reason, observed_before_error) ->
       incr divergences;
       Verification.Z3backend.block_last_input solver_session;
@@ -5630,7 +5651,10 @@ let solve_branch_objectives
     if candidates = [] || !divergences >= max_divergences then ()
     else begin
       Verification.Z3backend.set_solver_timeout solver_session timeout_ms;
-      match Verification.Z3backend.solve_uncovered solver_session candidates with
+      match
+        timed "z3_check_and_decode" candidates (fun () ->
+          Verification.Z3backend.solve_uncovered solver_session candidates)
+      with
       | Coverage_unsat ->
         if finalize_failures then
           List.iter (fun objective -> finalize objective "unsat" []) candidates
@@ -5701,7 +5725,10 @@ let solve_branch_objectives
         begin
           try
             Verification.Z3backend.compile_objective solver_session
-              ~on_objective ~objective_of_tag ~definitions objective body
+              ~on_objective
+              ~on_timing:(fun phase seconds ->
+                emit_timing phase [objective] seconds)
+              ~objective_of_tag ~definitions objective body
           with
           | Stack_overflow ->
             finalize objective "unknown"

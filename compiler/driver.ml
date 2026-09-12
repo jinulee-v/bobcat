@@ -1482,6 +1482,7 @@ module Commands = struct
         max_list_length
         solver_timeout_ms
         solver_timeout_max_ms
+        timings
         includes
         stdlib
         optimize
@@ -1500,7 +1501,7 @@ module Commands = struct
         prg;
       let scope = get_scope_uid prg.decl_ctx ex_scope in
       Bobcat.Interpreter.solve_branch_objectives max_list_length
-        solver_timeout_ms solver_timeout_max_ms prg scope
+        solver_timeout_ms solver_timeout_max_ms timings prg scope
     in
     let max_list_length =
       let open Cmdliner.Arg in
@@ -1530,6 +1531,16 @@ module Commands = struct
             "Maximum per-query Z3 timeout used by progressive UNKNOWN recovery \
              (default: 60000ms)."
     in
+    let timings =
+      let open Cmdliner.Arg in
+      value
+      & flag
+      & info ["bobcat-timings"]
+          ~doc:
+            "Emit machine-readable per-objective CPU timings for manifest \
+             indexing, slice selection, slice compilation, Z3/model decoding, \
+             and concrete replay."
+    in
     Cmd.v
       (Cmd.info "bobcat"
          ~doc:
@@ -1540,6 +1551,7 @@ module Commands = struct
         $ max_list_length
         $ solver_timeout_ms
         $ solver_timeout_max_ms
+        $ timings
         $ Cli.Flags.include_dirs
         $ Cli.Flags.stdlib_dir
         $ Cli.Flags.optimize

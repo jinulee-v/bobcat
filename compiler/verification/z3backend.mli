@@ -61,6 +61,7 @@ val reachable_objectives :
 
 val compile_objective :
   ?on_objective:(string -> unit) ->
+  ?on_timing:(string -> float -> unit) ->
   direct_session ->
   objective_of_tag:(Shared_ast.tag -> Catala_utils.Pos.t -> string option) ->
   definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
