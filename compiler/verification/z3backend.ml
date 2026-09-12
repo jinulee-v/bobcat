@@ -2400,13 +2400,22 @@ let rec bounded_value_constraints ctx max_list_length ty value =
     let element_constraints =
       List.mapi
         (fun index accessor ->
+          let element = Expr.mk_app ctx.ctx_z3 accessor [value] in
           let present =
             Arithmetic.mk_gt ctx.ctx_z3 length
               (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 index)
           in
-          bounded_value_constraints ctx max_list_length element_ty
-            (Expr.mk_app ctx.ctx_z3 accessor [value])
-          |> List.map (Boolean.mk_implies ctx.ctx_z3 present))
+          let padding =
+            let sort = Expr.get_sort element in
+            Expr.mk_const_s ctx.ctx_z3
+              ("bobcat_padding_"
+               ^ Digest.(to_hex (string (Sort.to_string sort))))
+              sort
+          in
+          Boolean.mk_implies ctx.ctx_z3 (Boolean.mk_not ctx.ctx_z3 present)
+            (Boolean.mk_eq ctx.ctx_z3 element padding)
+          :: (bounded_value_constraints ctx max_list_length element_ty element
+             |> List.map (Boolean.mk_implies ctx.ctx_z3 present)))
         elements
       |> List.concat
     in
@@ -3284,6 +3293,7 @@ type coverage_result =
 
 let solve_uncovered
     (session : direct_session)
+    ~(list_bound : int)
     (objectives : string list) : coverage_result =
   let ctx = session.direct_ctx in
   let selected =
@@ -3297,6 +3307,9 @@ let solve_uncovered
   | [] -> Coverage_unsat
   | _ ->
     Z3.Solver.push session.direct_solver;
+    Z3.Solver.add session.direct_solver
+      (bounded_value_constraints session.direct_ctx list_bound
+         session.direct_input_ty session.direct_input_expr);
     Z3.Solver.add session.direct_solver
       [Boolean.mk_or ctx.ctx_z3 (List.map snd selected)];
     let answer =

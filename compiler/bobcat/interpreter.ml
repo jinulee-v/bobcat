@@ -5452,23 +5452,29 @@ let solve_branch_objectives
   if solver_timeout_max_ms < solver_timeout_ms then
     Message.error
       "The maximum BOBCat solver timeout must be at least the initial timeout";
-  let emit_timing phase objectives cpu_seconds =
+  let emit_timing ?list_bound phase objectives cpu_seconds =
     if print_timings then begin
+      let metadata =
+        match list_bound with
+        | None -> []
+        | Some bound -> ["list_bound", `Int bound]
+      in
       let json =
         `Assoc
-          [ "phase", `String phase;
-            "objectives", `List (List.map (fun x -> `String x) objectives);
-            "cpu_ms", `Float (cpu_seconds *. 1000.) ]
+          ([ "phase", `String phase;
+             "objectives", `List (List.map (fun x -> `String x) objectives);
+             "cpu_ms", `Float (cpu_seconds *. 1000.) ]
+          @ metadata)
       in
       Message.result "BOBCAT_TIMING %s" (Yojson.Safe.to_string json);
       Format.pp_print_flush Format.std_formatter ()
     end
   in
-  let timed phase objectives action =
+  let timed ?list_bound phase objectives action =
     let started = Sys.time () in
     Fun.protect
       ~finally:(fun () ->
-        emit_timing phase objectives (Sys.time () -. started))
+        emit_timing ?list_bound phase objectives (Sys.time () -. started))
       action
   in
   let ctx = make_empty_context p.decl_ctx [] max_list_length |> init_context in
@@ -5646,17 +5652,23 @@ let solve_branch_objectives
   in
   let max_refinements_per_group = 3 in
   let rec solve_group
-      ?(refinements = 0) ~finalize_failures timeout_ms candidates =
+      ?(refinements = 0)
+      ~(list_bound : int)
+      ~finalize_failures timeout_ms candidates =
     let candidates = pending_from candidates in
     if candidates = [] || !divergences >= max_divergences then ()
     else begin
       Verification.Z3backend.set_solver_timeout solver_session timeout_ms;
       match
-        timed "z3_check_and_decode" candidates (fun () ->
-          Verification.Z3backend.solve_uncovered solver_session candidates)
+        timed ~list_bound "z3_check_and_decode" candidates (fun () ->
+          Verification.Z3backend.solve_uncovered solver_session ~list_bound
+            candidates)
       with
       | Coverage_unsat ->
-        if finalize_failures then
+        if list_bound < max_list_length then
+          solve_group ~list_bound:(list_bound + 1) ~finalize_failures
+            solver_timeout_ms candidates
+        else if finalize_failures then
           List.iter (fun objective -> finalize objective "unsat" []) candidates
       | Coverage_sat (model, predicted) ->
         let made_progress = replay_and_validate model predicted in
@@ -5667,7 +5679,7 @@ let solve_branch_objectives
              replay adds a counterexample refinement. In both cases the next
              query is strictly different: an objective disappeared or the
              exact spurious model was excluded. *)
-          solve_group ~finalize_failures solver_timeout_ms remaining
+          solve_group ~list_bound ~finalize_failures solver_timeout_ms remaining
         else if remaining <> [] && not made_progress && finalize_failures then
           if refinements + 1 >= max_refinements_per_group then
             List.iter
@@ -5680,17 +5692,20 @@ let solve_branch_objectives
                     "refinements", `Int (refinements + 1) ])
               remaining
           else
-            solve_group ~refinements:(refinements + 1) ~finalize_failures
-              solver_timeout_ms remaining
+            solve_group ~refinements:(refinements + 1) ~list_bound
+              ~finalize_failures solver_timeout_ms remaining
       | Coverage_unknown reason ->
         begin match candidates with
         | [_] when timeout_ms < solver_timeout_max_ms ->
           let next_timeout =
             min solver_timeout_max_ms (max (timeout_ms + 1) (timeout_ms * 5))
           in
-          solve_group ~finalize_failures next_timeout candidates
+          solve_group ~list_bound ~finalize_failures next_timeout candidates
         | [_] ->
-          if finalize_failures then
+          if list_bound < max_list_length then
+            solve_group ~list_bound:(list_bound + 1) ~finalize_failures
+              solver_timeout_ms candidates
+          else if finalize_failures then
             List.iter
               (fun objective ->
                 finalize objective "unknown"
@@ -5702,8 +5717,8 @@ let solve_branch_objectives
              until the expensive objective is isolated so its siblings still
              get a definitive result. *)
           let left, right = split candidates in
-          solve_group ~finalize_failures timeout_ms left;
-          solve_group ~finalize_failures timeout_ms right
+          solve_group ~list_bound ~finalize_failures timeout_ms left;
+          solve_group ~list_bound ~finalize_failures timeout_ms right
         end
     end
   in
@@ -5715,36 +5730,24 @@ let solve_branch_objectives
       (* Solve a newly available leaf immediately. UNSAT/UNKNOWN is provisional
          because another dynamic instance of the same source outcome may be
          discovered later; SAT is already safe after concrete replay. *)
-      solve_group ~finalize_failures:false solver_timeout_ms [objective]
+      solve_group ~list_bound:0 ~finalize_failures:false solver_timeout_ms
+        [objective]
     end
   in
   Printexc.record_backtrace true;
-  List.iter
-    (fun objective ->
-      if not (Hashtbl.mem final_results objective) then begin
-        begin
-          try
-            Verification.Z3backend.compile_objective solver_session
-              ~on_objective
-              ~on_timing:(fun phase seconds ->
-                emit_timing phase [objective] seconds)
-              ~objective_of_tag ~definitions objective body
-          with
-          | Stack_overflow ->
-            finalize objective "unknown"
-              [ "reason",
-                `String
-                  ("stack overflow while compiling objective slice:\n"
-                   ^ Printexc.get_backtrace ()) ]
-          | (Failure _ | Invalid_argument _ | Z3.Error _) as exn ->
-            finalize objective "unknown"
-              ["reason", `String (Printexc.to_string exn)]
-        end;
-        if Hashtbl.mem compiled objective
-           && not (Hashtbl.mem final_results objective)
-        then solve_group ~finalize_failures:true solver_timeout_ms [objective]
-      end)
-    objectives;
+  begin
+    try
+      timed "shared_compilation" objectives (fun () ->
+        Verification.Z3backend.compile_reachability solver_session
+          ~on_objective ~objective_of_tag ~definitions body)
+    with
+    | Stack_overflow ->
+      Message.warning "BOBCat shared compilation exhausted the OCaml stack:\n%s"
+        (Printexc.get_backtrace ())
+    | (Failure _ | Invalid_argument _ | Z3.Error _) as exn ->
+      Message.warning "BOBCat shared compilation stopped: %s"
+        (Printexc.to_string exn)
+  end;
   List.iter
     (fun objective -> Hashtbl.replace compiled objective ())
     (Verification.Z3backend.compiled_objectives solver_session);
@@ -5781,7 +5784,8 @@ let solve_branch_objectives
                 `String "concrete replay divergence budget exhausted" ])
           uncovered
       else begin
-        solve_group ~finalize_failures:true solver_timeout_ms candidates;
+        solve_group ~list_bound:0 ~finalize_failures:true solver_timeout_ms
+          candidates;
         cover ()
       end
   in
