@@ -816,8 +816,13 @@ and find_or_create_enum (ctx : context) (enum : EnumName.t) :
           ctx, ctr :: ctrs)
         ctrs (ctx, [])
     in
+    (* Datatype sort names share one global Z3 namespace. Under whole-program
+       compilation, distinct modules may legitimately declare the same source
+       basename (the public wrapper and the wrapped law both have [Enfant],
+       for example), so retain Catala's qualified identity here. *)
     let z3_enum =
-      Datatype.mk_sort_s ctx.ctx_z3 (EnumName.base enum) (List.rev z3_ctrs)
+      Datatype.mk_sort_s ctx.ctx_z3
+        ("enum!" ^ EnumName.to_string enum) (List.rev z3_ctrs)
     in
     add_z3enum enum z3_enum ctx, z3_enum
 
@@ -931,7 +936,7 @@ and find_or_create_struct (ctx : context) (s : StructName.t) :
   match StructName.Map.find_opt s ctx.ctx_z3structs with
   | Some s -> ctx, s
   | None ->
-    let s_name = StructName.base s in
+    let s_name = "struct!" ^ StructName.to_string s in
     let fields = StructName.Map.find s ctx.ctx_decl.ctx_structs in
     let z3_fieldnames =
       List.map
