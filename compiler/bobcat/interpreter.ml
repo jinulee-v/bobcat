@@ -5607,6 +5607,20 @@ let solve_branch_objectives
             && not (Hashtbl.mem final_results objective))
           objectives
       in
+      (* Every successfully replayed model is a valid concrete test, even when
+         it does not witness the symbolic objective that produced it.  Keep
+         the complete corpus; coverage credit remains based exclusively on
+         the outcomes observed by the concrete interpreter. *)
+      let replay_json =
+        `Assoc
+          [ "objectives",
+            `List (List.map (fun x -> `String x) predicted);
+            "input", model;
+            "outputs", outputs;
+            "branches",
+            `List (List.map (fun b -> `String b) observed) ]
+      in
+      Message.result "BOBCAT_REPLAY %s" (Yojson.Safe.to_string replay_json);
       if newly_covered = [] then begin
         incr divergences;
         Verification.Z3backend.block_last_input solver_session;
@@ -5622,16 +5636,6 @@ let solve_branch_objectives
         Message.result "BOBCAT_REFINEMENT %s" (Yojson.Safe.to_string json);
         false
       end else begin
-        let json =
-          `Assoc
-            [ "objectives",
-              `List (List.map (fun x -> `String x) predicted);
-              "input", model;
-              "outputs", outputs;
-              "branches",
-              `List (List.map (fun b -> `String b) observed) ]
-        in
-        Message.result "BOBCAT_REPLAY %s" (Yojson.Safe.to_string json);
         List.iter
           (fun objective ->
             finalize objective "sat"

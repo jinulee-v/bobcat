@@ -34,6 +34,12 @@ from those wrappers. CUTECat used its incremental/timeout
 configuration; BOBCat used progressive per-query Z3 limits from 2 to 60
 seconds. Both received the same outer time and process parallelism budgets.
 
+BOBCat retains every model that completes concrete replay, including models
+whose observed path disagrees with their symbolic objective. Such a model is
+credited only for the branch outcomes actually observed; the unresolved
+objective is blocked for that concrete input and retried. No coverage-based
+minimal-corpus pass is applied to BOBCat output.
+
 ---
 
 <div align="center">
