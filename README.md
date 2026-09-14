@@ -8,6 +8,29 @@ and is exposed through the `catala bobcat` command.
 This repository is based on the Catala compiler. The upstream Catala
 documentation follows.
 
+## Comparison with CUTECat
+
+The table below reports exact source-branch outcomes covered through only the
+public scopes declared in each `<dataset>_wrapper.catala_*` file. Adapter
+branches in the wrappers are excluded. Both engines ran on 13 September 2026
+with a 1,800-second limit per scope, 23 parallel workers, and maximum symbolic
+list length 5. This is one matched campaign, not a statistical estimate.
+
+| Dataset | Wrapper scopes | CUTECat | BOBCat | BOBCat difference |
+|---|---:|---:|---:|---:|
+| SARA | 9 | 51/425 (12.0%) | 130/425 (30.6%) | +18.6 pp |
+| Airline | 1 | 37/278 (13.3%) | 226/278 (81.3%) | +68.0 pp |
+| Aides logement | 4 | 207/2,706 (7.6%) | 51/2,706 (1.9%) | -5.8 pp |
+| Allocations familiales | 2 | 34/214 (15.9%) | 12/214 (5.6%) | -10.3 pp |
+| NSW community gaming | 7 | 14/14 (100.0%) | 14/14 (100.0%) | 0.0 pp |
+| **Combined** | **23** | **343/3,637 (9.4%)** | **433/3,637 (11.9%)** | **+2.5 pp** |
+
+Coverage means the union of outcomes observed by replay-validated generated
+examples divided by all written branch outcomes in the definitions entered
+from those wrappers. CUTECat used its incremental/timeout
+configuration; BOBCat used progressive per-query Z3 limits from 2 to 60
+seconds. Both received the same outer time and process parallelism budgets.
+
 ---
 
 <div align="center">
