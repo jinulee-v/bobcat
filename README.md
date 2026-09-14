@@ -12,18 +12,21 @@ documentation follows.
 
 The table below reports exact source-branch outcomes covered through only the
 public scopes declared in each `<dataset>_wrapper.catala_*` file. Adapter
-branches in the wrappers are excluded. Both engines ran on 13 September 2026
-with a 1,800-second limit per scope, 23 parallel workers, and maximum symbolic
-list length 5. This is one matched campaign, not a statistical estimate.
+branches in the wrappers are excluded. Both engines ran with a 1,800-second
+limit per scope, 23 available workers, and maximum symbolic list length 5.
+The Aides logement row was rerun on 14 September 2026 after restoring
+`archives.catala_fr`; both engines include those historical rules and use the
+same 4,706-outcome denominator. This is one matched campaign, not a
+statistical estimate.
 
 | Dataset | Wrapper scopes | CUTECat | BOBCat | BOBCat difference |
 |---|---:|---:|---:|---:|
 | SARA | 9 | 51/425 (12.0%) | 130/425 (30.6%) | +18.6 pp |
 | Airline | 1 | 37/278 (13.3%) | 226/278 (81.3%) | +68.0 pp |
-| Aides logement | 4 | 207/2,706 (7.6%) | 51/2,706 (1.9%) | -5.8 pp |
+| Aides logement | 4 | 328/4,706 (7.0%) | 1,002/4,706 (21.3%) | +14.3 pp |
 | Allocations familiales | 2 | 34/214 (15.9%) | 12/214 (5.6%) | -10.3 pp |
 | NSW community gaming | 7 | 14/14 (100.0%) | 14/14 (100.0%) | 0.0 pp |
-| **Combined** | **23** | **343/3,637 (9.4%)** | **433/3,637 (11.9%)** | **+2.5 pp** |
+| **Combined** | **23** | **464/5,637 (8.2%)** | **1,384/5,637 (24.6%)** | **+16.3 pp** |
 
 Coverage means the union of outcomes observed by replay-validated generated
 examples divided by all written branch outcomes in the definitions entered
