@@ -1,3 +1,15 @@
+# BOBCat
+
+BOBCat is a goal-directed branch-coverage engine for Catala. It encodes branch
+objectives in Z3, decodes satisfying models into Catala inputs, and validates
+coverage by concrete replay. The implementation lives in `compiler/bobcat/`
+and is exposed through the `catala bobcat` command.
+
+This repository is based on the Catala compiler. The upstream Catala
+documentation follows.
+
+---
+
 <div align="center">
   <img src="https://github.com/CatalaLang/catala/raw/master/doc/images/logo.png" alt="Catala logo" width="120"/>
   <h3 align="center">
