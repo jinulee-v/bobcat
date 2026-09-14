@@ -62,6 +62,19 @@ type context = {
   ctx_symbolic_list_bound : int;
   ctx_allow_fatal_dummy : bool;
   ctx_z3definitions : (typed expr, typed expr) Var.Map.t;
+  ctx_z3valuecache :
+    (typed expr, Expr.expr * Expr.expr list) Var.Map.t;
+  (* Shared translations of named value definitions. The saved constraints
+     are reintroduced at each guarded use, so caching preserves both DAG
+     sharing and the guard under which partial operations are valid. *)
+  ctx_z3resolving : (typed expr) Var.Set.t;
+  (* Definitions are followed by [translate_expr]. This set rejects an
+     accidental recursive definition instead of silently replacing it with an
+     unconstrained Z3 constant. Catala programs are recursion-free. *)
+  ctx_z3freevars : (typed expr) Var.Set.t;
+  (* Variables which genuinely denote symbolic inputs. In BOBCat direct mode,
+     every other unresolved variable is a malformed encoding, not a license to
+     invent an unconstrained value. *)
   (* Lifted default values are encoded as
      [Default(defined, conflict, value)].  Keeping this distinct from the
      underlying value is what lets BOBCat reason about EEmpty,
@@ -1428,19 +1441,59 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
   match Mark.remove vc with
   | EVar v -> (
     match Var.Map.find_opt v ctx.ctx_z3matchsubsts with
-    | None ->
-      (* We are in the standard case, where this is a true Catala variable *)
+    | Some e ->
+      (* A lambda or match binder already has its exact symbolic value. *)
+      ctx, e
+    | None -> begin
+      match Var.Map.find_opt v ctx.ctx_z3valuecache with
+      | Some (value, constraints) ->
+        { ctx with
+          ctx_z3constraints = constraints @ ctx.ctx_z3constraints },
+        value
+      | None -> begin match Var.Map.find_opt v ctx.ctx_z3definitions with
+      | Some definition ->
+        if Var.Set.mem v ctx.ctx_z3resolving then
+          failwith
+            ("[Z3 encoding] recursive value definition: " ^ unique_name v)
+        else
+          let former_resolving = ctx.ctx_z3resolving in
+          let ctx =
+            { ctx with
+              ctx_z3resolving = Var.Set.add v ctx.ctx_z3resolving }
+          in
+          let previous_constraints = ctx.ctx_z3constraints in
+          let ctx, value = translate_expr ctx definition in
+          let rec new_constraints acc = function
+            | constraints when constraints == previous_constraints ->
+              List.rev acc
+            | constraint_ :: rest ->
+              new_constraints (constraint_ :: acc) rest
+            | [] ->
+              failwith
+                "[Z3 encoding] definition constraint accumulator lost its tail"
+          in
+          let constraints =
+            new_constraints [] ctx.ctx_z3constraints
+          in
+          { ctx with
+            ctx_z3resolving = former_resolving;
+            ctx_z3valuecache =
+              Var.Map.add v (value, constraints) ctx.ctx_z3valuecache },
+          value
+      | None when ctx.ctx_allow_fatal_dummy
+                  && not (Var.Set.mem v ctx.ctx_z3freevars) ->
+        failwith
+          ("[Z3 encoding] unresolved non-input value: " ^ unique_name v)
+      | None ->
+      (* This is a genuine free variable: a verification variable in the
+         generic backend, or the one BOBCat scope-input value. *)
       let (Typed { ty = t; _ }) = Mark.get vc in
       let name = unique_name v in
       let ctx = add_z3var name v t ctx in
       let ctx, ty = translate_typ ctx (Mark.remove t) in
       let z3_var = Expr.mk_const_s ctx.ctx_z3 name ty in
       ctx, z3_var
-    | Some e ->
-      (* This variable is a temporary variable generated during VC translation
-         of a match. It actually corresponds to applying an accessor to an enum,
-         the corresponding Z3 expression was previously stored in the context *)
-      ctx, e)
+      end end)
   | EExternal _ -> failwith "[Z3 encoding] EExternal unsupported"
   | EStruct { fields; name } ->
     let ctx, z3_struct = find_or_create_struct ctx name in
@@ -1914,17 +1967,21 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
             "[Z3 encoding] a bound function did not resolve to a lambda"
         end
       | None ->
-        let (Typed { ty = f_ty; _ }) = Mark.get head in
-        let ctx, fd = find_or_create_funcdecl ctx v f_ty in
-        (* Fold_right preserves argument order. *)
-        let ctx, z3_args =
-          List.fold_right
-            (fun arg (ctx, acc) ->
-              let ctx, z3_arg = translate_expr ctx arg in
-              ctx, z3_arg :: acc)
-            args (ctx, [])
-        in
-        ctx, Expr.mk_app ctx.ctx_z3 fd z3_args
+        if ctx.ctx_allow_fatal_dummy then
+          failwith
+            ("[Z3 encoding] unresolved internal function: " ^ unique_name v)
+        else
+          let (Typed { ty = f_ty; _ }) = Mark.get head in
+          let ctx, fd = find_or_create_funcdecl ctx v f_ty in
+          (* Fold_right preserves argument order. *)
+          let ctx, z3_args =
+            List.fold_right
+              (fun arg (ctx, acc) ->
+                let ctx, z3_arg = translate_expr ctx arg in
+                ctx, z3_arg :: acc)
+              args (ctx, [])
+          in
+          ctx, Expr.mk_app ctx.ctx_z3 fd z3_args
       end
     | EExternal { name } ->
       let runtime_module, function_name = external_runtime_name name in
@@ -2367,6 +2424,9 @@ module Backend = struct
       ctx_symbolic_list_bound = 5;
       ctx_allow_fatal_dummy = false;
       ctx_z3definitions = Var.Map.empty;
+      ctx_z3valuecache = Var.Map.empty;
+      ctx_z3resolving = Var.Set.empty;
+      ctx_z3freevars = Var.Set.empty;
       ctx_z3constraints = [];
     }
 end
@@ -2518,7 +2578,8 @@ let create_direct_session
     { ctx with
       ctx_max_list_length = array_capacity;
       ctx_symbolic_list_bound = max_list_length;
-      ctx_allow_fatal_dummy = true }
+      ctx_allow_fatal_dummy = true;
+      ctx_z3freevars = Var.Set.singleton input_var }
   in
   let ctx, input_sort = translate_typ ctx (Mark.remove input_ty) in
   let input_expr = Expr.mk_const_s ctx.ctx_z3 (unique_name input_var) input_sort in
