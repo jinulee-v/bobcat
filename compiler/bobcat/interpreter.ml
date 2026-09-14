@@ -5442,6 +5442,7 @@ let replay_model ctx p scope input =
 
 let solve_branch_objectives
     (max_list_length : int)
+    (workers : int)
     (solver_timeout_ms : int)
     (solver_timeout_max_ms : int)
     (print_timings : bool)
@@ -5449,9 +5450,16 @@ let solve_branch_objectives
   s : unit =
   if solver_timeout_ms <= 0 then
     Message.error "The initial BOBCat solver timeout must be positive";
+  if workers <= 0 then
+    Message.error "The number of BOBCat workers must be positive";
   if solver_timeout_max_ms < solver_timeout_ms then
     Message.error
       "The maximum BOBCat solver timeout must be at least the initial timeout";
+  let output_mutex = Mutex.create () in
+  let synchronized mutex action =
+    Mutex.lock mutex;
+    Fun.protect ~finally:(fun () -> Mutex.unlock mutex) action
+  in
   let emit_timing ?list_bound phase objectives cpu_seconds =
     if print_timings then begin
       let metadata =
@@ -5466,8 +5474,9 @@ let solve_branch_objectives
              "cpu_ms", `Float (cpu_seconds *. 1000.) ]
           @ metadata)
       in
-      Message.result "BOBCAT_TIMING %s" (Yojson.Safe.to_string json);
-      Format.pp_print_flush Format.std_formatter ()
+      synchronized output_mutex (fun () ->
+        Message.result "BOBCAT_TIMING %s" (Yojson.Safe.to_string json);
+        Format.pp_print_flush Format.std_formatter ())
     end
   in
   let timed ?list_bound phase objectives action =
@@ -5522,12 +5531,6 @@ let solve_branch_objectives
     Hashtbl.fold (fun _ pair pairs -> pair :: pairs) ctx.ctx_branch_pairs []
     |> List.sort_uniq String.compare
   in
-  let solver_session =
-    Verification.Z3backend.create_direct_session p.decl_ctx ~input_var
-      ~input_ty ~max_list_length ~array_capacity ~solver_timeout_ms
-  in
-  let final_results = Hashtbl.create (List.length indexed_objectives) in
-  let compiled = Hashtbl.create (List.length indexed_objectives) in
   let objective_of_tag tag pos =
     Hashtbl.find_opt ctx.ctx_branch_pairs (outcome_key tag pos)
   in
@@ -5564,23 +5567,58 @@ let solve_branch_objectives
      make uncovered source outcomes disappear from the coverage metric. *)
   print_json_string_list "BOBCAT_BRANCH_MANIFEST" objectives;
   Format.pp_print_flush Format.std_formatter ();
-  let finalize objective status fields =
-    if not (Hashtbl.mem final_results objective) then begin
-      Hashtbl.replace final_results objective (status, fields);
-      print_goal_result objective status fields;
-      Format.pp_print_flush Format.std_formatter ()
-    end
+  let state_mutex = Mutex.create () in
+  let replay_mutex = Mutex.create () in
+  let final_results = Hashtbl.create (List.length indexed_objectives) in
+  let leased = Hashtbl.create (List.length indexed_objectives) in
+  let is_final objective =
+    synchronized state_mutex (fun () -> Hashtbl.mem final_results objective)
   in
+  let finalize objective status fields =
+    let added =
+      synchronized state_mutex (fun () ->
+        if Hashtbl.mem final_results objective then false
+        else begin
+          Hashtbl.replace final_results objective (status, fields);
+          true
+        end)
+    in
+    if added then
+      synchronized output_mutex (fun () ->
+        print_goal_result objective status fields;
+        Format.pp_print_flush Format.std_formatter ())
+  in
+  let lease objectives =
+    synchronized state_mutex (fun () ->
+      objectives
+      |> List.filter (fun objective ->
+           not (Hashtbl.mem final_results objective)
+           && not (Hashtbl.mem leased objective))
+      |> List.map (fun objective ->
+           Hashtbl.replace leased objective ();
+           objective))
+  in
+  let release objectives =
+    synchronized state_mutex (fun () ->
+      List.iter (Hashtbl.remove leased) objectives)
+  in
+  let run_worker _worker_id =
+  let solver_session =
+    Verification.Z3backend.create_direct_session p.decl_ctx ~input_var
+      ~input_ty ~max_list_length ~array_capacity ~solver_timeout_ms
+  in
+  let compiled = Hashtbl.create (List.length indexed_objectives) in
   let pending_from candidates =
     List.filter
       (fun objective ->
         Hashtbl.mem compiled objective
-        && not (Hashtbl.mem final_results objective))
+        && not (is_final objective))
       candidates
   in
   let divergences = ref 0 in
   let max_divergences = max 32 (4 * List.length objectives) in
   let replay_and_validate model predicted =
+    synchronized replay_mutex (fun () ->
     Message.debug "BOBCat candidate input: %s" (Yojson.Safe.to_string model);
     match timed "concrete_replay" predicted (fun () -> replay_model ctx p s model) with
     | Error (reason, observed_before_error) ->
@@ -5595,16 +5633,17 @@ let solve_branch_objectives
             `List (List.map (fun x -> `String x) observed_before_error);
             "reason", `String reason ]
       in
-      Message.result "BOBCAT_REFINEMENT %s" (Yojson.Safe.to_string json);
-      Message.warning "BOBCat rejected symbolic input %s: %s"
-        (Yojson.Safe.to_string model) reason;
+      synchronized output_mutex (fun () ->
+        Message.result "BOBCAT_REFINEMENT %s" (Yojson.Safe.to_string json);
+        Message.warning "BOBCat rejected symbolic input %s: %s"
+          (Yojson.Safe.to_string model) reason);
       false
     | Ok (observed, outputs) ->
       let newly_covered =
         List.filter
           (fun objective ->
             List.mem objective observed
-            && not (Hashtbl.mem final_results objective))
+            && not (is_final objective))
           objectives
       in
       (* Every successfully replayed model is a valid concrete test, even when
@@ -5620,7 +5659,8 @@ let solve_branch_objectives
             "branches",
             `List (List.map (fun b -> `String b) observed) ]
       in
-      Message.result "BOBCAT_REPLAY %s" (Yojson.Safe.to_string replay_json);
+      synchronized output_mutex (fun () ->
+        Message.result "BOBCAT_REPLAY %s" (Yojson.Safe.to_string replay_json));
       if newly_covered = [] then begin
         incr divergences;
         Verification.Z3backend.block_last_input solver_session;
@@ -5633,7 +5673,8 @@ let solve_branch_objectives
               `List (List.map (fun x -> `String x) observed);
               "reason", `String "predicted objective was not observed" ]
         in
-        Message.result "BOBCAT_REFINEMENT %s" (Yojson.Safe.to_string json);
+        synchronized output_mutex (fun () ->
+          Message.result "BOBCAT_REFINEMENT %s" (Yojson.Safe.to_string json));
         false
       end else begin
         List.iter
@@ -5642,7 +5683,7 @@ let solve_branch_objectives
               ["input", model; "validated", `Bool true])
           newly_covered;
         true
-      end
+      end)
   in
   let split values =
     let left_count = max 1 (List.length values / 2) in
@@ -5734,8 +5775,12 @@ let solve_branch_objectives
       (* Solve a newly available leaf immediately. UNSAT/UNKNOWN is provisional
          because another dynamic instance of the same source outcome may be
          discovered later; SAT is already safe after concrete replay. *)
-      solve_group ~list_bound:0 ~finalize_failures:false solver_timeout_ms
-        [objective]
+      match lease [objective] with
+      | [] -> ()
+      | claimed ->
+        Fun.protect ~finally:(fun () -> release claimed) (fun () ->
+          solve_group ~list_bound:0 ~finalize_failures:false solver_timeout_ms
+            claimed)
     end
   in
   Printexc.record_backtrace true;
@@ -5763,7 +5808,7 @@ let solve_branch_objectives
   List.iter
     (fun objective ->
       if not (Hashtbl.mem compiled objective)
-         && not (Hashtbl.mem final_results objective)
+         && not (is_final objective)
       then
         finalize objective "unknown"
           [ "reason",
@@ -5779,28 +5824,51 @@ let solve_branch_objectives
     match uncovered with
     | [] -> ()
     | _ ->
-      let candidates = take 8 uncovered in
-      if !divergences >= max_divergences then
-        List.iter
-          (fun objective ->
-            finalize objective "unknown"
-              [ "reason",
-                `String "concrete replay divergence budget exhausted" ])
-          uncovered
+      let candidates = lease (take 8 uncovered) in
+      if candidates = [] then ()
       else begin
-        solve_group ~list_bound:0 ~finalize_failures:true solver_timeout_ms
-          candidates;
+        Fun.protect ~finally:(fun () -> release candidates) (fun () ->
+          if !divergences >= max_divergences then
+            List.iter
+              (fun objective ->
+                finalize objective "unknown"
+                  [ "reason",
+                    `String "concrete replay divergence budget exhausted" ])
+              candidates
+          else
+            solve_group ~list_bound:0 ~finalize_failures:true solver_timeout_ms
+              candidates);
         cover ()
       end
   in
   cover ();
+  ()
+  in
+  let worker_errors = ref [] in
+  let guarded_worker worker_id =
+    try run_worker worker_id with exn ->
+      let backtrace = Printexc.get_raw_backtrace () in
+      synchronized state_mutex (fun () ->
+        worker_errors := (exn, backtrace) :: !worker_errors)
+  in
+  if workers = 1 then guarded_worker 0
+  else begin
+    List.init workers (fun worker_id -> Thread.create guarded_worker worker_id)
+    |> List.iter Thread.join
+  end;
+  begin match !worker_errors with
+  | (exn, backtrace) :: _ -> Printexc.raise_with_backtrace exn backtrace
+  | [] -> ()
+  end;
   List.iter
     (fun objective ->
-      if not (Hashtbl.mem final_results objective) then
+      if not (is_final objective) then
         finalize objective "unknown"
           ["reason", `String "objective was not classified"])
     objectives;
-  Message.result "BOBCAT_DONE %d" (List.length objectives)
+  synchronized output_mutex (fun () ->
+    Message.result "BOBCAT_DONE %d" (List.length objectives);
+    Format.pp_print_flush Format.std_formatter ())
 
 let interpret_program_concolic
     (type m)
