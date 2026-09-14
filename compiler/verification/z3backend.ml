@@ -22,6 +22,60 @@ open Z3
 module StringMap = String.Map
 module Runtime = Catala_runtime
 
+module PhysicalExprTable = Hashtbl.Make (struct
+  type t = typed expr
+
+  let equal left right = left == right
+  let hash = Hashtbl.hash
+end)
+
+module DefinitionGuardTable = Hashtbl.Make (struct
+  type t = int * Expr.expr * (int * Expr.expr) list
+
+  let equal (left_var, left_guard, left_substs)
+      (right_var, right_guard, right_substs) =
+    left_var = right_var && Expr.equal left_guard right_guard
+    && List.length left_substs = List.length right_substs
+    && List.for_all2
+         (fun (left_id, left_value) (right_id, right_value) ->
+           left_id = right_id && Expr.equal left_value right_value)
+         left_substs right_substs
+
+  let hash = Hashtbl.hash
+end)
+
+module DefaultStatusTable = Hashtbl.Make (struct
+  type t = int * Expr.expr * (int * Expr.expr) list
+
+  let equal (left_var, left_guard, left_substs)
+      (right_var, right_guard, right_substs) =
+    left_var = right_var
+    && Expr.equal left_guard right_guard
+    && List.length left_substs = List.length right_substs
+    && List.for_all2
+         (fun (left_id, left_value) (right_id, right_value) ->
+           left_id = right_id && Expr.equal left_value right_value)
+         left_substs right_substs
+
+  let hash = Hashtbl.hash
+end)
+
+module DefaultExprStatusTable = Hashtbl.Make (struct
+  type t = typed expr * Expr.expr * (int * Expr.expr) list
+
+  let equal (left_expr, left_guard, left_substs)
+      (right_expr, right_guard, right_substs) =
+    left_expr == right_expr
+    && Expr.equal left_guard right_guard
+    && List.length left_substs = List.length right_substs
+    && List.for_all2
+         (fun (left_id, left_value) (right_id, right_value) ->
+           left_id = right_id && Expr.equal left_value right_value)
+         left_substs right_substs
+
+  let hash = Hashtbl.hash
+end)
+
 type array_encoding = {
   array_sort : Sort.sort;
   array_make : FuncDecl.func_decl;
@@ -2227,15 +2281,21 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     let ex_defined = List.map (fun (defined, _, _) -> defined) ex_parts in
     let ex_conflict = List.map (fun (_, conflict, _) -> conflict) ex_parts in
     let two_defined =
-      List.concat_map
-        (fun (i, left) ->
-          List.filter_map
-            (fun (j, right) ->
-              if i < j then
-                Some (Boolean.mk_and ctx.ctx_z3 [left; right])
-              else None)
-            (List.mapi (fun j x -> j, x) ex_defined))
-        (List.mapi (fun i x -> i, x) ex_defined)
+      let terms =
+        List.map
+          (fun defined ->
+            Boolean.mk_ite ctx.ctx_z3 defined
+              (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 1)
+              (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 0))
+          ex_defined
+      in
+      let count =
+        match terms with
+        | [] -> Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 0
+        | _ -> Arithmetic.mk_add ctx.ctx_z3 terms
+      in
+      Arithmetic.mk_gt ctx.ctx_z3 count
+        (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 1)
     in
     let any xs =
       match xs with
@@ -2245,7 +2305,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     let any_defined = any ex_defined in
     let cons_defined, cons_conflict, cons_value = parts z3_cons in
     let no_exception = Boolean.mk_not ctx.ctx_z3 any_defined in
-    let is_conflict = any (ex_conflict @ two_defined) in
+    let is_conflict = any (two_defined :: ex_conflict) in
     let is_conflict =
       Boolean.mk_or ctx.ctx_z3
         [ is_conflict;
@@ -2441,9 +2501,15 @@ type direct_session = {
   mutable direct_objectives : Expr.expr StringMap.t;
   mutable direct_last_input : Expr.expr option;
   mutable direct_unknowns : string StringMap.t;
-  direct_compiled_definition_guards : (string, unit) Hashtbl.t;
+  direct_compiled_definition_guards : unit DefinitionGuardTable.t;
   direct_deferred_definitions : (unit -> unit) Queue.t;
   mutable direct_on_objective : string -> unit;
+  mutable direct_error_status_only : bool;
+  mutable direct_skip_error_status : bool;
+  direct_default_status_cache :
+    (Expr.expr * Expr.expr) DefaultStatusTable.t;
+  direct_default_expr_status_cache :
+    (Expr.expr * Expr.expr) DefaultExprStatusTable.t;
 }
 
 let rec bounded_value_constraints ctx max_list_length ty value =
@@ -2597,9 +2663,13 @@ let create_direct_session
     direct_objectives = StringMap.empty;
     direct_last_input = None;
     direct_unknowns = StringMap.empty;
-    direct_compiled_definition_guards = Hashtbl.create 257;
+    direct_compiled_definition_guards = DefinitionGuardTable.create 257;
     direct_deferred_definitions = Queue.create ();
-    direct_on_objective = (fun _ -> ()) }
+    direct_on_objective = (fun _ -> ());
+    direct_error_status_only = false;
+    direct_skip_error_status = false;
+    direct_default_status_cache = DefaultStatusTable.create 257;
+    direct_default_expr_status_cache = DefaultExprStatusTable.create 1021 }
 
 let set_solver_timeout session timeout_ms =
   let timeout_ms = max 1 timeout_ms in
@@ -2779,6 +2849,20 @@ let reachable_objectives ~objective_of_tag ~definitions body =
 let guarded_constraint ctx guard constraint_ =
   Boolean.mk_implies ctx.ctx_z3 guard constraint_
 
+let has_duration_type (e : typed expr) =
+  let (Typed { ty; _ }) = Mark.get e in
+  match Mark.remove ty with TLit TDuration -> true | _ -> false
+
+let operator_has_explicit_failure :
+    type a. a operator -> typed expr list -> bool =
+ fun op args ->
+  match op with
+  | Map2 | Div | Div_int_int | Div_rat_rat | Div_mon_mon | Div_mon_int
+  | Div_mon_rat | Div_dur_dur | Add_dat_dur Dates_calc.AbortOnRound
+  | Sub_dat_dur Dates_calc.AbortOnRound -> true
+  | Eq | Lt | Lte | Gt | Gte -> List.exists has_duration_type args
+  | _ -> false
+
 let encode_under_guard session guard e =
   let previous_constraints = session.direct_ctx.ctx_z3constraints in
   let ctx, value = translate_expr session.direct_ctx e in
@@ -2798,14 +2882,227 @@ let encode_under_guard session guard e =
   add_new ctx.ctx_z3constraints;
   value
 
-let rec resolve_definition definitions (e : typed expr) =
+let default_status_of_z3 ctx default =
+  match List.hd (Datatype.get_accessors (Expr.get_sort default)) with
+  | defined :: conflict :: _ ->
+    ( Expr.mk_app ctx.ctx_z3 defined [default],
+      Expr.mk_app ctx.ctx_z3 conflict [default] )
+  | _ -> failwith "[Z3 encoding] malformed default datatype"
+
+let relevant_substitutions definitions ctx (e : typed expr) =
+  let rec collect seen substitutions var =
+    if Var.Set.mem var seen then seen, substitutions
+    else
+      let seen = Var.Set.add var seen in
+      match Var.Map.find_opt var ctx.ctx_z3matchsubsts with
+      | Some value -> seen, (Bindlib.uid_of var, value) :: substitutions
+      | None ->
+        begin match Var.Map.find_opt var definitions with
+        | None -> seen, substitutions
+        | Some definition ->
+          Var.Set.elements (Shared_ast.Expr.free_vars definition)
+          |> List.fold_left
+               (fun (seen, substitutions) dependency ->
+                 collect seen substitutions dependency)
+               (seen, substitutions)
+        end
+  in
+  Var.Set.elements (Shared_ast.Expr.free_vars e)
+  |> List.fold_left
+       (fun (seen, substitutions) var -> collect seen substitutions var)
+       (Var.Set.empty, [])
+  |> snd
+
+let rec encode_default_status session guard definitions (e : typed expr) =
+  let substitutions =
+    relevant_substitutions definitions session.direct_ctx e
+  in
+  let key = e, guard, substitutions in
+  match
+    DefaultExprStatusTable.find_opt
+      session.direct_default_expr_status_cache key
+  with
+  | Some status -> status
+  | None ->
+    let status =
+      encode_default_status_uncached session guard definitions e
+    in
+    DefaultExprStatusTable.replace session.direct_default_expr_status_cache key
+      status;
+    status
+
+and encode_default_status_uncached session guard definitions (e : typed expr) =
+  let ctx () = session.direct_ctx in
+  let z3 () = session.direct_ctx.ctx_z3 in
+  let false_ () = Boolean.mk_false (z3 ()) in
+  let true_ () = Boolean.mk_true (z3 ()) in
+  let any = function [] -> false_ () | xs -> Boolean.mk_or (z3 ()) xs in
   match Mark.remove e with
+  | EEmpty -> false_ (), false_ ()
+  | EPureDefault _ -> true_ (), false_ ()
+  | EAppOp { op = (Tag _, _); args = [inner]; _ } ->
+    encode_default_status session guard definitions inner
   | EVar var ->
-    begin match Var.Map.find_opt var definitions with
-    | Some definition -> resolve_definition definitions definition
-    | None -> e
+    begin match Var.Map.find_opt var session.direct_ctx.ctx_z3matchsubsts with
+    | Some value -> default_status_of_z3 (ctx ()) value
+    | None ->
+      begin match Var.Map.find_opt var definitions with
+      | Some definition ->
+        if Var.Set.mem var session.direct_ctx.ctx_z3resolving then
+          (* A re-entrant scope-variable placeholder denotes the absence of a
+             previously computed value. It is empty, not a fresh default. *)
+          false_ (), false_ ()
+        else
+        let substitutions =
+          relevant_substitutions definitions session.direct_ctx definition
+        in
+        let key = Bindlib.uid_of var, guard, substitutions in
+        begin match
+          DefaultStatusTable.find_opt session.direct_default_status_cache key
+        with
+        | Some status -> status
+        | None ->
+          let former_resolving = session.direct_ctx.ctx_z3resolving in
+          session.direct_ctx <-
+            { session.direct_ctx with
+              ctx_z3resolving = Var.Set.add var former_resolving };
+          let status =
+            Fun.protect
+              ~finally:(fun () ->
+                session.direct_ctx <-
+                  { session.direct_ctx with
+                    ctx_z3resolving = former_resolving })
+              (fun () ->
+                encode_default_status session guard definitions definition)
+          in
+          DefaultStatusTable.replace session.direct_default_status_cache key
+            status;
+          status
+        end
+      | None ->
+        encode_under_guard session guard e
+        |> default_status_of_z3 (ctx ())
+      end
     end
-  | _ -> e
+  | EApp { f; args; _ } ->
+    let f = resolve_callable definitions f in
+    begin match Mark.remove f with
+    | EAbs { binder; _ }
+      when Bindlib.mbinder_arity binder = List.length args ->
+      let vars, body = Bindlib.unmbind binder in
+      let former_substs = session.direct_ctx.ctx_z3matchsubsts in
+      let former_z3definitions = session.direct_ctx.ctx_z3definitions in
+      let local_definitions = ref definitions in
+      Fun.protect
+        ~finally:(fun () ->
+          session.direct_ctx <-
+            { session.direct_ctx with
+              ctx_z3matchsubsts = former_substs;
+              ctx_z3definitions = former_z3definitions })
+        (fun () ->
+          Array.iter2
+            (fun var argument ->
+              local_definitions :=
+                Var.Map.add var argument !local_definitions;
+              session.direct_ctx <-
+                { session.direct_ctx with
+                  ctx_z3definitions =
+                    Var.Map.add var argument
+                      session.direct_ctx.ctx_z3definitions };
+              let (Typed { ty; _ }) = Mark.get argument in
+              match Mark.remove ty with
+              | TArrow _ -> ()
+              | _ ->
+                let value = encode_under_guard session guard argument in
+                session.direct_ctx <-
+                  add_z3matchsubst var value session.direct_ctx)
+            vars (Array.of_list args);
+          encode_default_status session guard !local_definitions body)
+    | _ ->
+      encode_under_guard session guard e |> default_status_of_z3 (ctx ())
+    end
+  | EIfThenElse { cond; etrue; efalse } ->
+    let predicate = encode_under_guard session guard cond in
+    let yes_guard = Boolean.mk_and (z3 ()) [guard; predicate] in
+    let no_guard =
+      Boolean.mk_and (z3 ()) [guard; Boolean.mk_not (z3 ()) predicate]
+    in
+    let yes_defined, yes_conflict =
+      encode_default_status session yes_guard definitions etrue
+    in
+    let no_defined, no_conflict =
+      encode_default_status session no_guard definitions efalse
+    in
+    ( Boolean.mk_ite (z3 ()) predicate yes_defined no_defined,
+      Boolean.mk_ite (z3 ()) predicate yes_conflict no_conflict )
+  | EDefault
+      { excepts =
+          [ ( EApp
+                { f = EVar _, _; args = [ELit LUnit, _]; _ },
+              _ ) ];
+        just = ELit (LBool true), _;
+        cons } ->
+    (* Scope variables are lowered through a re-entrant placeholder default:
+       [<reentrant () | true :- value>]. The placeholder exists to diagnose a
+       genuine recursive evaluation; it is not a competing source rule. Since
+       Catala's DCalc graph is acyclic here, normal termination is exactly that
+       of [value]. Avoid expanding the placeholder as an ordinary call. *)
+    encode_default_status session guard definitions cons
+  | EDefault { excepts = [only]; just = ELit (LBool false), _; _ } ->
+    (* The standard scope-variable lowering wraps its actual defining default
+       as [<definition | false :- empty>]. This wrapper has exactly the same
+       defined/conflict status as [definition]. *)
+    encode_default_status session guard definitions only
+  | EDefault { excepts = []; just = ELit (LBool true), _; cons } ->
+    encode_default_status session guard definitions cons
+  | EDefault { excepts; just; cons } ->
+    let exception_parts =
+      List.map (encode_default_status session guard definitions) excepts
+    in
+    let exception_defined = List.map fst exception_parts in
+    let exception_conflicts = List.map snd exception_parts in
+    let any_defined = any exception_defined in
+    let no_exception = Boolean.mk_not (z3 ()) any_defined in
+    let base_guard = Boolean.mk_and (z3 ()) [guard; no_exception] in
+    let justification = encode_under_guard session base_guard just in
+    let consequence_guard =
+      Boolean.mk_and (z3 ()) [base_guard; justification]
+    in
+    let consequence_defined, consequence_conflict =
+      encode_default_status session consequence_guard definitions cons
+    in
+    let multiple_exceptions =
+      let terms =
+        List.map
+          (fun defined ->
+            Boolean.mk_ite (z3 ()) defined
+              (Arithmetic.Integer.mk_numeral_i (z3 ()) 1)
+              (Arithmetic.Integer.mk_numeral_i (z3 ()) 0))
+          exception_defined
+      in
+      let count =
+        match terms with
+        | [] -> Arithmetic.Integer.mk_numeral_i (z3 ()) 0
+        | _ -> Arithmetic.mk_add (z3 ()) terms
+      in
+      Arithmetic.mk_gt (z3 ()) count
+        (Arithmetic.Integer.mk_numeral_i (z3 ()) 1)
+    in
+    let defined =
+      Boolean.mk_or (z3 ())
+        [ any_defined;
+          Boolean.mk_and (z3 ())
+            [no_exception; justification; consequence_defined] ]
+    in
+    let conflict =
+      any
+        (multiple_exceptions :: exception_conflicts
+        @ [ Boolean.mk_and (z3 ())
+              [no_exception; justification; consequence_conflict] ])
+    in
+    defined, conflict
+  | _ ->
+    encode_under_guard session guard e |> default_status_of_z3 (ctx ())
 
 let rec compile_reach_expr
     ~should_visit session objective_of_tag definitions guard (e : typed expr) =
@@ -2932,16 +3229,12 @@ let rec compile_reach_expr
     List.iter (compile guard) excepts;
     begin
       try
-        let encoded = List.map (encode_under_guard session guard) excepts in
         let defined_values =
           List.map
-            (fun default ->
-              match
-                List.hd (Datatype.get_accessors (Expr.get_sort default))
-              with
-              | defined :: _ -> Expr.mk_app (ctx ()) defined [default]
-              | _ -> assert false)
-            encoded
+            (fun exception_ ->
+              fst
+                (encode_default_status session guard definitions exception_))
+            excepts
         in
         let any_defined =
           match defined_values with
@@ -3008,6 +3301,40 @@ let rec compile_reach_expr
     | _ ->
       compile guard resolved;
       List.iter (compile guard) args
+    end
+  | EAppOp { op = (Map2, _); args = [fn; left; right]; _ } ->
+    compile guard left;
+    compile guard right;
+    begin
+      try
+        let left_array = encode_under_guard session guard left in
+        let right_array = encode_under_guard session guard right in
+        let left_length, left_elements =
+          bounded_array_components
+            ~limit:(expression_list_bound session.direct_ctx left)
+            session.direct_ctx left_array
+        in
+        let right_length, right_elements =
+          bounded_array_components
+            ~limit:(expression_list_bound session.direct_ctx right)
+            session.direct_ctx right_array
+        in
+        Z3.Solver.add session.direct_solver
+          [guarded_constraint session.direct_ctx guard
+             (Boolean.mk_eq (ctx ()) left_length right_length)];
+        List.iteri
+          (fun index (left_element, right_element) ->
+            let present =
+              Arithmetic.mk_gt (ctx ()) left_length
+                (Arithmetic.Integer.mk_numeral_i (ctx ()) index)
+            in
+            compile_function
+              (Boolean.mk_and (ctx ()) [guard; present]) fn
+              [left_element; right_element])
+          (List.combine left_elements right_elements)
+      with
+      | Failure reason | Invalid_argument reason | Z3.Error reason ->
+        mark_expr_unknown session objective_of_tag fn reason
     end
   | EAppOp { op = ((Map | Filter | Find), _); args = [fn; list]; _ } ->
     compile guard list;
@@ -3106,8 +3433,15 @@ let rec compile_reach_expr
        Applications above beta-reduce it; bounded higher-order list operators
        receive a dedicated unrolling translation separately. *)
     ()
-  | EAppOp { args; _ } | EArray args | ETuple args ->
-    List.iter (compile guard) args
+  | EAppOp { op = (op, _); args; _ } ->
+    List.iter (compile guard) args;
+    if operator_has_explicit_failure op args then
+      begin
+        try ignore (encode_under_guard session guard e) with
+        | Failure reason | Invalid_argument reason | Z3.Error reason ->
+          mark_expr_unknown session objective_of_tag e reason
+      end
+  | EArray args | ETuple args -> List.iter (compile guard) args
   | EStruct { fields; _ } ->
     StructField.Map.iter (fun _ field -> compile guard field) fields
   | EAssert assertion ->
@@ -3122,11 +3456,23 @@ let rec compile_reach_expr
         mark_expr_unknown session objective_of_tag assertion reason
     end
   | EErrorOnEmpty inner ->
-    (* DCalc lowers error-on-empty into ordinary guarded defaults and matches.
-       Their [EFatalError] leaf below contributes [not guard], which is the
-       precise normal-termination condition without forcing the value encoder
-       to manufacture a value for an exception. *)
-    compile guard inner
+    if not session.direct_error_status_only then compile guard inner;
+    (* Compute only the default's status. In particular, do not translate the
+       payloads of every historical exception merely to decide whether exactly
+       one rule applies. *)
+    if not session.direct_skip_error_status then begin
+      try
+        let defined, conflict =
+          encode_default_status session guard definitions inner
+        in
+        Z3.Solver.add session.direct_solver
+          [guarded_constraint session.direct_ctx guard
+             (Boolean.mk_and (ctx ())
+                [defined; Boolean.mk_not (ctx ()) conflict])]
+      with
+      | Failure reason | Invalid_argument reason | Z3.Error reason ->
+        mark_expr_unknown session objective_of_tag e reason
+    end
   | EStructAccess { e; _ } | ETupleAccess { e; _ } | EInj { e; _ }
   | EPureDefault e -> compile guard e
   | EFatalError _ ->
@@ -3139,11 +3485,18 @@ let rec compile_reach_expr
          definition once per symbolic guard, rather than either treating it as
          opaque (which loses its failures/branches) or blindly expanding every
          reference (which recreates the old whole-expression explosion). *)
-      let guard_id = Digest.(to_hex (string (Expr.to_string guard))) in
-      let key = string_of_int (Bindlib.uid_of var) ^ ":" ^ guard_id in
-      if not (Hashtbl.mem session.direct_compiled_definition_guards key) then
+      let key =
+        ( Bindlib.uid_of var,
+          guard,
+          relevant_substitutions definitions session.direct_ctx definition )
+      in
+      if not
+           (DefinitionGuardTable.mem
+              session.direct_compiled_definition_guards key)
+      then
       begin
-        Hashtbl.replace session.direct_compiled_definition_guards key ();
+        DefinitionGuardTable.replace
+          session.direct_compiled_definition_guards key ();
         let captured_substs = session.direct_ctx.ctx_z3matchsubsts in
         let captured_z3definitions = session.direct_ctx.ctx_z3definitions in
         Queue.add
@@ -3165,6 +3518,90 @@ let rec compile_reach_expr
   | EExternal _ | ELit _ | EEmpty | EPos _ | EBad ->
     ()
   | _ -> ()
+
+let compile_normal_termination session ~definitions body =
+  let definitions =
+    List.fold_left
+      (fun env (var, definition) -> Var.Map.add var definition env)
+      Var.Map.empty definitions
+  in
+  let definition_memo = Hashtbl.create 257 in
+  let expression_memo = PhysicalExprTable.create 1021 in
+  let rec contains_failure ~include_empty seen (e : typed expr) =
+    match PhysicalExprTable.find_opt expression_memo e with
+    | Some answer -> answer
+    | None ->
+    let here =
+      match Mark.remove e with
+      | EAssert _ | EFatalError _ -> not include_empty
+      | EErrorOnEmpty _ -> include_empty
+      | EAppOp { op = (op, _); args; _ } ->
+        (not include_empty) && operator_has_explicit_failure op args
+      | _ -> false
+    in
+    let answer =
+      here
+      ||
+      match Mark.remove e with
+      | EVar var ->
+        if Var.Set.mem var seen then false
+        else begin
+          match Var.Map.find_opt var definitions with
+          | None -> false
+          | Some definition ->
+            let key = Bindlib.uid_of var in
+            begin match Hashtbl.find_opt definition_memo key with
+            | Some answer -> answer
+            | None ->
+              let answer =
+                contains_failure ~include_empty (Var.Set.add var seen)
+                  definition
+              in
+              Hashtbl.replace definition_memo key answer;
+              answer
+            end
+        end
+      | _ ->
+        Shared_ast.Expr.shallow_fold
+          (fun child answer ->
+            answer || contains_failure ~include_empty seen child)
+          e false
+    in
+    PhysicalExprTable.replace expression_memo e answer;
+    answer
+  in
+  let entry = Boolean.mk_true session.direct_ctx.ctx_z3 in
+  session.direct_ctx <-
+    { session.direct_ctx with ctx_z3definitions = definitions };
+  Fun.protect
+    ~finally:(fun () ->
+      session.direct_error_status_only <- false;
+      session.direct_skip_error_status <- false)
+    (fun () ->
+      Queue.clear session.direct_deferred_definitions;
+      DefinitionGuardTable.clear session.direct_compiled_definition_guards;
+      session.direct_error_status_only <- true;
+      compile_reach_expr
+        ~should_visit:(contains_failure ~include_empty:true Var.Set.empty)
+        session (fun _ _ -> None) definitions entry body;
+      while not (Queue.is_empty session.direct_deferred_definitions) do
+        Queue.take session.direct_deferred_definitions ()
+      done;
+      DefinitionGuardTable.clear session.direct_compiled_definition_guards;
+      Hashtbl.clear definition_memo;
+      PhysicalExprTable.clear expression_memo;
+      session.direct_error_status_only <- false;
+      session.direct_skip_error_status <- true;
+      compile_reach_expr
+        ~should_visit:(contains_failure ~include_empty:false Var.Set.empty)
+        session (fun _ _ -> None) definitions entry body;
+      while not (Queue.is_empty session.direct_deferred_definitions) do
+        Queue.take session.direct_deferred_definitions ()
+      done);
+  (* Reachability compilation needs to revisit the same sharing nodes to
+     register their objectives, but it reuses values and constraints cached by
+     this validity pass. *)
+  DefinitionGuardTable.clear session.direct_compiled_definition_guards
 
 let compile_reachability
     ?(on_objective = fun _ -> ())
@@ -3332,7 +3769,7 @@ let compile_objective
   session.direct_ctx <-
     { session.direct_ctx with ctx_z3definitions = definitions };
   Queue.clear session.direct_deferred_definitions;
-  Hashtbl.clear session.direct_compiled_definition_guards;
+  DefinitionGuardTable.clear session.direct_compiled_definition_guards;
   session.direct_on_objective <- on_objective;
   let compilation_started = Sys.time () in
   Fun.protect

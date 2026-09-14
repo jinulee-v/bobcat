@@ -37,6 +37,17 @@ val create_direct_session :
 
 val set_solver_timeout : direct_session -> int -> unit
 
+val compile_normal_termination :
+  direct_session ->
+  definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
+               Shared_ast.typed Dcalc.Ast.expr) list ->
+  Shared_ast.typed Dcalc.Ast.expr ->
+  unit
+(** Backward-select and encode the syntactically explicit conditions required
+    for the selected entry scope to terminate normally: assertions,
+    error-on-empty/default definedness, fatal leaves, fallible operators, and
+    equal-length map operations. *)
+
 val compile_reachability :
   ?on_objective:(string -> unit) ->
   direct_session ->
