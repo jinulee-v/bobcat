@@ -5443,6 +5443,7 @@ let replay_model ctx p scope input =
 let solve_branch_objectives
     (max_list_length : int)
     (workers : int)
+    (optimization_timeout_ms : int)
     (solver_timeout_ms : int)
     (solver_timeout_max_ms : int)
     (print_timings : bool)
@@ -5452,6 +5453,8 @@ let solve_branch_objectives
     Message.error "The initial BOBCat solver timeout must be positive";
   if workers <= 0 then
     Message.error "The number of BOBCat workers must be positive";
+  if optimization_timeout_ms < 0 then
+    Message.error "The BOBCat MaxSAT timeout must be non-negative";
   if solver_timeout_max_ms < solver_timeout_ms then
     Message.error
       "The maximum BOBCat solver timeout must be at least the initial timeout";
@@ -5573,6 +5576,12 @@ let solve_branch_objectives
   let leased = Hashtbl.create (List.length indexed_objectives) in
   let is_final objective =
     synchronized state_mutex (fun () -> Hashtbl.mem final_results objective)
+  in
+  let uncovered_snapshot () =
+    synchronized state_mutex (fun () ->
+      List.filter
+        (fun objective -> not (Hashtbl.mem final_results objective))
+        objectives)
   in
   let finalize objective status fields =
     let added =
@@ -5706,8 +5715,15 @@ let solve_branch_objectives
       Verification.Z3backend.set_solver_timeout solver_session timeout_ms;
       match
         timed ~list_bound "z3_check_and_decode" candidates (fun () ->
+          let maximize_objectives =
+            uncovered_snapshot ()
+            |> List.filter (fun objective -> Hashtbl.mem compiled objective)
+          in
           Verification.Z3backend.solve_uncovered solver_session ~list_bound
-            candidates)
+            ~optimization_timeout_ms:
+              (if optimization_timeout_ms = 0 then 0
+               else min timeout_ms optimization_timeout_ms)
+            ~maximize_objectives candidates)
       with
       | Coverage_unsat ->
         if list_bound < max_list_length then

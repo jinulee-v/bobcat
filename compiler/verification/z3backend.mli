@@ -79,7 +79,12 @@ val compiled_objectives : direct_session -> string list
 (** Ask the persistent solver for a model reaching any member of the supplied
     uncovered set. *)
 val solve_uncovered :
-  direct_session -> list_bound:int -> string list -> coverage_result
+  direct_session ->
+  list_bound:int ->
+  optimization_timeout_ms:int ->
+  maximize_objectives:string list ->
+  string list ->
+  coverage_result
 
 (** Conservatively refine after a failed replay by excluding the Catala-visible
     input equivalence class. Invisible bounded-list padding and inactive sum

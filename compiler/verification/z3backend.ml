@@ -3360,6 +3360,8 @@ type coverage_result =
 let solve_uncovered
     (session : direct_session)
     ~(list_bound : int)
+    ~(optimization_timeout_ms : int)
+    ~(maximize_objectives : string list)
     (objectives : string list) : coverage_result =
   let ctx = session.direct_ctx in
   let selected =
@@ -3372,30 +3374,79 @@ let solve_uncovered
   match selected with
   | [] -> Coverage_unsat
   | _ ->
+    let decode model predicted_pool =
+      let input_value = eval_model model session.direct_input_expr in
+      session.direct_last_input <- Some input_value;
+      let predicted =
+        List.filter_map
+          (fun (objective, reach) ->
+            if Boolean.is_true (eval_model model reach) then Some objective
+            else None)
+          predicted_pool
+      in
+      Coverage_sat
+        ( json_of_z3model_expr ctx model ~scope_input:true
+            session.direct_input_ty session.direct_input_expr,
+          predicted )
+    in
+    let hard_constraints =
+      bounded_value_constraints session.direct_ctx list_bound
+        session.direct_input_ty session.direct_input_expr
+      @ [Boolean.mk_or ctx.ctx_z3 (List.map snd selected)]
+    in
+    if optimization_timeout_ms > 0 then begin
+      let optimize = Z3.Optimize.mk_opt ctx.ctx_z3 in
+      let params = Z3.Params.mk_params ctx.ctx_z3 in
+      Z3.Params.add_int params
+        (Z3.Symbol.mk_string ctx.ctx_z3 "timeout") optimization_timeout_ms;
+      Z3.Optimize.set_parameters optimize params;
+      Z3.Optimize.add optimize
+        (Z3.Solver.get_assertions session.direct_solver @ hard_constraints);
+      let maximize_selected =
+        maximize_objectives
+        |> List.filter_map (fun objective ->
+             Option.map (fun reach -> objective, reach)
+               (StringMap.find_opt objective session.direct_objectives))
+      in
+      let predicted_pool =
+        List.fold_left
+          (fun pool ((objective, _) as candidate) ->
+            if List.exists (fun (name, _) -> String.equal name objective) pool
+            then pool
+            else candidate :: pool)
+          maximize_selected selected
+      in
+      let group = Z3.Symbol.mk_string ctx.ctx_z3 "bobcat_coverage" in
+      List.iter
+        (fun (_, reach) ->
+          ignore (Z3.Optimize.add_soft optimize reach "1" group))
+        maximize_selected;
+      let hard_holds model =
+        Z3.Solver.get_assertions session.direct_solver @ hard_constraints
+        |> List.for_all (fun constraint_ ->
+             Boolean.is_true (eval_model model constraint_))
+      in
+      match Z3.Optimize.check optimize with
+      | Z3.Solver.SATISFIABLE ->
+        begin match Z3.Optimize.get_model optimize with
+        | Some model -> decode model predicted_pool
+        | None -> Coverage_unknown "Z3 Optimize returned SAT without a model"
+        end
+      | Z3.Solver.UNSATISFIABLE -> Coverage_unsat
+      | Z3.Solver.UNKNOWN ->
+        begin match Z3.Optimize.get_model optimize with
+        | Some model when hard_holds model -> decode model predicted_pool
+        | _ ->
+          Coverage_unknown (Z3.Optimize.get_reason_unknown optimize)
+        end
+    end else begin
     Z3.Solver.push session.direct_solver;
-    Z3.Solver.add session.direct_solver
-      (bounded_value_constraints session.direct_ctx list_bound
-         session.direct_input_ty session.direct_input_expr);
-    Z3.Solver.add session.direct_solver
-      [Boolean.mk_or ctx.ctx_z3 (List.map snd selected)];
+    Z3.Solver.add session.direct_solver hard_constraints;
     let answer =
     match Z3.Solver.check session.direct_solver [] with
     | Z3.Solver.SATISFIABLE ->
       begin match Z3.Solver.get_model session.direct_solver with
-      | Some model ->
-        let input_value = eval_model model session.direct_input_expr in
-        session.direct_last_input <- Some input_value;
-        let predicted =
-          List.filter_map
-            (fun (objective, reach) ->
-              if Boolean.is_true (eval_model model reach) then Some objective
-              else None)
-            selected
-        in
-        Coverage_sat
-          ( json_of_z3model_expr ctx model ~scope_input:true
-              session.direct_input_ty session.direct_input_expr,
-            predicted )
+      | Some model -> decode model selected
       | None -> Coverage_unknown "Z3 returned SAT without a model"
       end
     | Z3.Solver.UNSATISFIABLE -> Coverage_unsat
@@ -3404,6 +3455,7 @@ let solve_uncovered
     in
     Z3.Solver.pop session.direct_solver 1;
     answer
+    end
 
 let rec semantic_value_equality ctx ty left right =
   let eq = Boolean.mk_eq ctx.ctx_z3 in

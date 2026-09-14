@@ -1481,6 +1481,7 @@ module Commands = struct
         options
         max_list_length
         workers
+        maxsat_timeout_ms
         solver_timeout_ms
         solver_timeout_max_ms
         timings
@@ -1502,7 +1503,8 @@ module Commands = struct
         prg;
       let scope = get_scope_uid prg.decl_ctx ex_scope in
       Bobcat.Interpreter.solve_branch_objectives max_list_length
-        workers solver_timeout_ms solver_timeout_max_ms timings prg scope
+        workers maxsat_timeout_ms solver_timeout_ms solver_timeout_max_ms
+        timings prg scope
     in
     let max_list_length =
       let open Cmdliner.Arg in
@@ -1533,6 +1535,16 @@ module Commands = struct
              (default: 1). Workers use independent Z3 sessions and dynamically \
              lease uncovered branch objectives from shared concrete coverage."
     in
+    let maxsat_timeout_ms =
+      let open Cmdliner.Arg in
+      value
+      & opt int 5000
+      & info ["bobcat-maxsat-timeout-ms"] ~docv:"MILLISECONDS"
+          ~doc:
+            "Maximum time spent maximizing newly covered branch outcomes per \
+             query (default: 5000ms). Zero disables MaxSAT and uses the first \
+             satisfying model."
+    in
     let solver_timeout_max_ms =
       let open Cmdliner.Arg in
       value
@@ -1561,6 +1573,7 @@ module Commands = struct
         $ Cli.Flags.Global.options
         $ max_list_length
         $ workers
+        $ maxsat_timeout_ms
         $ solver_timeout_ms
         $ solver_timeout_max_ms
         $ timings
