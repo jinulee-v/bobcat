@@ -5442,7 +5442,6 @@ let replay_model ctx p scope input =
 
 let solve_branch_objectives
     (max_list_length : int)
-    (workers : int)
     (optimization_timeout_ms : int)
     (solver_timeout_ms : int)
     (solver_timeout_max_ms : int)
@@ -5451,8 +5450,6 @@ let solve_branch_objectives
   s : unit =
   if solver_timeout_ms <= 0 then
     Message.error "The initial BOBCat solver timeout must be positive";
-  if workers <= 0 then
-    Message.error "The number of BOBCat workers must be positive";
   if optimization_timeout_ms < 0 then
     Message.error "The BOBCat MaxSAT timeout must be non-negative";
   if solver_timeout_max_ms < solver_timeout_ms then
@@ -5860,22 +5857,7 @@ let solve_branch_objectives
   cover ();
   ()
   in
-  let worker_errors = ref [] in
-  let guarded_worker worker_id =
-    try run_worker worker_id with exn ->
-      let backtrace = Printexc.get_raw_backtrace () in
-      synchronized state_mutex (fun () ->
-        worker_errors := (exn, backtrace) :: !worker_errors)
-  in
-  if workers = 1 then guarded_worker 0
-  else begin
-    List.init workers (fun worker_id -> Thread.create guarded_worker worker_id)
-    |> List.iter Thread.join
-  end;
-  begin match !worker_errors with
-  | (exn, backtrace) :: _ -> Printexc.raise_with_backtrace exn backtrace
-  | [] -> ()
-  end;
+  run_worker 0;
   List.iter
     (fun objective ->
       if not (is_final objective) then

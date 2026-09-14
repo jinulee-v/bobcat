@@ -1480,7 +1480,6 @@ module Commands = struct
     let run
         options
         max_list_length
-        workers
         maxsat_timeout_ms
         solver_timeout_ms
         solver_timeout_max_ms
@@ -1503,7 +1502,7 @@ module Commands = struct
         prg;
       let scope = get_scope_uid prg.decl_ctx ex_scope in
       Bobcat.Interpreter.solve_branch_objectives max_list_length
-        workers maxsat_timeout_ms solver_timeout_ms solver_timeout_max_ms
+        maxsat_timeout_ms solver_timeout_ms solver_timeout_max_ms
         timings prg scope
     in
     let max_list_length =
@@ -1524,16 +1523,6 @@ module Commands = struct
           ~doc:
             "Initial per-query Z3 timeout (default: 2000ms). Unknown singleton \
              objectives are retried with progressively larger timeouts."
-    in
-    let workers =
-      let open Cmdliner.Arg in
-      value
-      & opt int 1
-      & info ["bobcat-workers"] ~docv:"COUNT"
-          ~doc:
-            "Number of coordinated solver workers for one entry scope \
-             (default: 1). Workers use independent Z3 sessions and dynamically \
-             lease uncovered branch objectives from shared concrete coverage."
     in
     let maxsat_timeout_ms =
       let open Cmdliner.Arg in
@@ -1572,7 +1561,6 @@ module Commands = struct
         const run
         $ Cli.Flags.Global.options
         $ max_list_length
-        $ workers
         $ maxsat_timeout_ms
         $ solver_timeout_ms
         $ solver_timeout_max_ms

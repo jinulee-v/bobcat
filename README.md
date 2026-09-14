@@ -5,13 +5,11 @@ objectives in Z3, decodes satisfying models into Catala inputs, and validates
 coverage by concrete replay. The implementation lives in `compiler/bobcat/`
 and is exposed through the `catala bobcat` command.
 
-Within one entry scope, `--bobcat-workers=N` runs independent Z3 sessions
-against a mutex-protected global set of concretely covered outcomes. Workers
-dynamically lease different uncovered objectives rather than using fixed
-partitions. By default, each query spends at most five seconds maximizing the
-number of currently uncovered outcomes satisfied by its model. Configure this
-with `--bobcat-maxsat-timeout-ms=MILLISECONDS`; setting it to zero restores
-first-model SAT selection without disabling parallel workers.
+Within one entry scope BOBCat uses one Z3 session. By default, each query spends
+at most five seconds maximizing the number of currently uncovered outcomes
+satisfied by its model. Configure this with
+`--bobcat-maxsat-timeout-ms=MILLISECONDS`; setting it to zero restores
+first-model SAT selection.
 
 This repository is based on the Catala compiler. The upstream Catala
 documentation follows.
