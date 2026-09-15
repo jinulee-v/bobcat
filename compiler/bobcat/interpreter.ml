@@ -5799,9 +5799,6 @@ let solve_branch_objectives
   Printexc.record_backtrace true;
   begin
     try
-      timed "normality_compilation" objectives (fun () ->
-        Verification.Z3backend.compile_normal_termination solver_session
-          ~definitions body);
       timed "shared_compilation" objectives (fun () ->
         Verification.Z3backend.compile_reachability solver_session
           ~on_objective ~objective_of_tag ~definitions body)
