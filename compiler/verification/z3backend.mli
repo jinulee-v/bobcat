@@ -83,8 +83,6 @@ val compiled_objectives : direct_session -> string list
 val solve_uncovered :
   direct_session ->
   list_bound:int ->
-  optimization_timeout_ms:int ->
-  maximize_objectives:string list ->
   string list ->
   coverage_result
 

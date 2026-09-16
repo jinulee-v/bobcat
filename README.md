@@ -6,9 +6,8 @@ coverage by concrete replay. The implementation lives in `compiler/bobcat/`
 and is exposed through the `catala bobcat` command.
 
 BOBCat uses a fresh Z3 session for each branch goal and reuses that session
-through semantic refinement and timeout retries. The default query is ordinary
-SAT: `--bobcat-maxsat-timeout-ms=0`. Positive values explicitly enable optional
-coverage maximization; the retained benchmark below did not use MaxSAT.
+through semantic refinement and timeout retries. Each query asks for the first
+satisfying model; the engine does not perform MaxSAT optimization.
 
 This repository is based on the Catala compiler. The upstream Catala
 documentation follows.

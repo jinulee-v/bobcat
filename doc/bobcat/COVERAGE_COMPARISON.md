@@ -10,11 +10,12 @@ September 15, 2026. It is a result report, not an ablation study.
 - demand-driven compilation
 - maximum input-list length 5
 - intermediate-list storage bound 5
-- ordinary SAT queries (`--bobcat-maxsat-timeout-ms=0`)
+- ordinary first-model SAT queries
 - coverage credited only after successful complete native replay
 
-MaxSAT was **not** used in the retained run. Results from optional eager or
-MaxSAT strategies are not combined with these numbers.
+MaxSAT was **not** used in the retained run. The MaxSAT implementation was
+subsequently removed after a matched probe reduced aggregate coverage from 425
+to 215 outcomes under the same 180-second per-wrapper budget.
 
 ## Source branch outcomes
 

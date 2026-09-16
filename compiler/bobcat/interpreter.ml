@@ -5450,7 +5450,6 @@ let solve_branch_objectives
     ~(demand : bool)
     ~(intermediate_list_bound : int option)
     (max_list_length : int)
-    (optimization_timeout_ms : int)
     (solver_timeout_ms : int)
     (solver_timeout_max_ms : int)
     (print_timings : bool)
@@ -5458,8 +5457,6 @@ let solve_branch_objectives
   s : unit =
   if solver_timeout_ms <= 0 then
     Message.error "The initial BOBCat solver timeout must be positive";
-  if optimization_timeout_ms < 0 then
-    Message.error "The BOBCat MaxSAT timeout must be non-negative";
   if solver_timeout_max_ms < solver_timeout_ms then
     Message.error
       "The maximum BOBCat solver timeout must be at least the initial timeout";
@@ -5650,9 +5647,7 @@ let solve_branch_objectives
         Verification.Z3backend.set_solver_timeout solver_session timeout_ms;
         match timed ~list_bound:compilation_bound "z3_check_and_decode" [objective]
           (fun () -> Verification.Z3backend.solve_uncovered solver_session
-            ~list_bound:compilation_bound
-            ~optimization_timeout_ms:(min timeout_ms optimization_timeout_ms)
-            ~maximize_objectives:(uncovered_snapshot ()) [objective]) with
+            ~list_bound:compilation_bound [objective]) with
         | Coverage_unsat ->
           if last_bound then
             if !complete && unknowns = [] then

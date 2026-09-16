@@ -39,7 +39,6 @@ val solve_branch_objectives :
   int ->
   int ->
   int ->
-  int ->
   bool ->
   (Shared_ast.dcalc, Shared_ast.typed) Shared_ast.gexpr Shared_ast.program ->
   Shared_ast.ScopeName.t ->
