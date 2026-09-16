@@ -1484,6 +1484,8 @@ module Commands = struct
         solver_timeout_ms
         solver_timeout_max_ms
         timings
+        demand
+        intermediate_list_bound
         includes
         stdlib
         optimize
@@ -1501,8 +1503,8 @@ module Commands = struct
         ~hashf:Hash.(finalise ~monomorphize_types:false)
         prg;
       let scope = get_scope_uid prg.decl_ctx ex_scope in
-      Bobcat.Interpreter.solve_branch_objectives max_list_length
-        maxsat_timeout_ms solver_timeout_ms solver_timeout_max_ms
+      Bobcat.Interpreter.solve_branch_objectives ~demand ~intermediate_list_bound
+        max_list_length maxsat_timeout_ms solver_timeout_ms solver_timeout_max_ms
         timings prg scope
     in
     let max_list_length =
@@ -1527,11 +1529,11 @@ module Commands = struct
     let maxsat_timeout_ms =
       let open Cmdliner.Arg in
       value
-      & opt int 5000
+      & opt int 0
       & info ["bobcat-maxsat-timeout-ms"] ~docv:"MILLISECONDS"
           ~doc:
             "Maximum time spent maximizing newly covered branch outcomes per \
-             query (default: 5000ms). Zero disables MaxSAT and uses the first \
+             query (default: 0ms). Zero disables MaxSAT and uses the first \
              satisfying model."
     in
     let solver_timeout_max_ms =
@@ -1542,6 +1544,18 @@ module Commands = struct
           ~doc:
             "Maximum per-query Z3 timeout used by progressive UNKNOWN recovery \
              (default: 60000ms)."
+    in
+    let demand =
+      let open Cmdliner.Arg in
+      value & opt (enum ["demand", true; "eager", false]) true
+      & info ["bobcat-strategy"] ~docv:"STRATEGY"
+          ~doc:"Compilation strategy: demand (default) refines dependencies after replay; eager compiles branch reachability before solving."
+    in
+    let intermediate_list_bound =
+      let open Cmdliner.Arg in
+      value & opt (some int) None
+      & info ["bobcat-intermediate-list-bound"] ~docv:"LENGTH"
+          ~doc:"Use an explicit intermediate-list storage bound instead of automatic capacity analysis. Input bounds and source literals are retained. This restricted search produces witnesses but never certifies UNSAT."
     in
     let timings =
       let open Cmdliner.Arg in
@@ -1565,6 +1579,8 @@ module Commands = struct
         $ solver_timeout_ms
         $ solver_timeout_max_ms
         $ timings
+        $ demand
+        $ intermediate_list_bound
         $ Cli.Flags.include_dirs
         $ Cli.Flags.stdlib_dir
         $ Cli.Flags.optimize

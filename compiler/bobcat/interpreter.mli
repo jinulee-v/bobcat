@@ -34,6 +34,8 @@ val enumerate_branch_objectives :
     and concretely replay each objective. No concrete seed, path prefix, or
     constraint flipping is involved. *)
 val solve_branch_objectives :
+  demand:bool ->
+  intermediate_list_bound:int option ->
   int ->
   int ->
   int ->
@@ -45,6 +47,7 @@ val solve_branch_objectives :
 open Bobcat_types
 
 val interpret_program_concolic :
+  ?on_input:((Uid.MarkedString.info * conc_expr) list -> bool) ->
   bool ->
   Optimizations.flag list ->
   int option ->
@@ -55,3 +58,6 @@ val interpret_program_concolic :
   ScopeName.t ->
   (Uid.MarkedString.info * conc_expr) list
 (** Concolic interpreter *)
+
+val solve_path_objectives :
+  int -> (dcalc, typed) gexpr program -> ScopeName.t -> unit

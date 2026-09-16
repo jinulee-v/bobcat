@@ -5,16 +5,15 @@ objectives in Z3, decodes satisfying models into Catala inputs, and validates
 coverage by concrete replay. The implementation lives in `compiler/bobcat/`
 and is exposed through the `catala bobcat` command.
 
-Within one entry scope BOBCat uses one Z3 session. By default, each query spends
-at most five seconds maximizing the number of currently uncovered outcomes
-satisfied by its model. Configure this with
-`--bobcat-maxsat-timeout-ms=MILLISECONDS`; setting it to zero restores
-first-model SAT selection.
+BOBCat uses a fresh Z3 session for each branch goal and reuses that session
+through semantic refinement and timeout retries. The default query is ordinary
+SAT: `--bobcat-maxsat-timeout-ms=0`. Positive values explicitly enable optional
+coverage maximization; the retained benchmark below did not use MaxSAT.
 
 This repository is based on the Catala compiler. The upstream Catala
 documentation follows.
 
-## Comparison with CUTECat
+## Coverage comparison
 
 The table below reports exact source-branch outcomes covered through only the
 public scopes declared in each `<dataset>_wrapper.catala_*` file. Adapter
@@ -27,24 +26,31 @@ statistical estimate.
 
 | Dataset | Wrapper scopes | CUTECat | BOBCat | BOBCat difference |
 |---|---:|---:|---:|---:|
-| SARA | 9 | 51/425 (12.0%) | 130/425 (30.6%) | +18.6 pp |
-| Airline | 1 | 37/278 (13.3%) | 226/278 (81.3%) | +68.0 pp |
-| Aides logement | 4 | 328/4,706 (7.0%) | 1,002/4,706 (21.3%) | +14.3 pp |
-| Allocations familiales | 2 | 34/214 (15.9%) | 12/214 (5.6%) | -10.3 pp |
+| SARA | 9 | 51/425 (12.0%) | 116/425 (27.3%) | +15.3 pp |
+| Airline | 1 | 37/278 (13.3%) | 243/278 (87.4%) | +74.1 pp |
+| Aides logement | 4 | 328/4,706 (7.0%) | 1,479/4,706 (31.4%) | +24.5 pp |
+| Allocations familiales | 2 | 34/214 (15.9%) | 113/214 (52.8%) | +36.9 pp |
 | NSW community gaming | 7 | 14/14 (100.0%) | 14/14 (100.0%) | 0.0 pp |
-| **Combined** | **23** | **464/5,637 (8.2%)** | **1,384/5,637 (24.6%)** | **+16.3 pp** |
+| **Combined** | **23** | **464/5,637 (8.2%)** | **1,965/5,637 (34.9%)** | **+26.6 pp** |
 
 Coverage means the union of outcomes observed by replay-validated generated
 examples divided by all written branch outcomes in the definitions entered
 from those wrappers. CUTECat used its incremental/timeout
 configuration; BOBCat used progressive per-query Z3 limits from 2 to 60
-seconds. Both received the same outer time and process parallelism budgets.
+seconds and ordinary SAT queries. Both received the same outer time and process
+parallelism budgets. The retained BOBCat dataset contains 402 validated tests.
+
+The BOBCat figures are from the retained demand-driven campaign. They should
+not be read as an ablation of individual optimizations. Six wrappers timed out,
+and four ended with resource errors or SIGKILL after retaining their earlier
+validated tests. See the
+[full configuration, comparison, and limitations](doc/bobcat/COVERAGE_COMPARISON.md).
 
 BOBCat retains every model that completes concrete replay, including models
 whose observed path disagrees with their symbolic objective. Such a model is
-credited only for the branch outcomes actually observed; the unresolved
-objective is blocked for that concrete input and retried. No coverage-based
-minimal-corpus pass is applied to BOBCat output.
+credited only for the branch outcomes actually observed; unresolved objectives
+are refined when supported. No coverage-based minimal-corpus pass is applied to
+BOBCat output.
 
 ---
 

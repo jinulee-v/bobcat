@@ -29,10 +29,23 @@ type array_encoding = {
   array_elements : FuncDecl.func_decl list;
 }
 
+module ExpressionIdentity = Hashtbl.Make(struct
+  type t = typed expr
+  let equal a b = a == b
+  let hash e =
+    let pos = Shared_ast.Expr.pos e in
+    let variable = match Mark.remove e with EVar v -> Bindlib.uid_of v | _ -> -1 in
+    Hashtbl.hash (Pos.get_file pos, Pos.get_start_line pos,
+                  Pos.get_start_column pos, Pos.get_end_line pos, variable)
+end)
+
+type named_function_type = FunctionStruct of StructName.t | FunctionEnum of EnumName.t
+
 type context = {
   ctx_z3 : Z3.context;
   (* The Z3 context, used to create symbols and expressions *)
   ctx_decl : decl_ctx;
+  ctx_function_types : (named_function_type, unit) Hashtbl.t;
   (* The declaration context from the Catala program, containing information to
      precisely pretty print Catala expressions *)
   ctx_funcdecl : (typed expr, FuncDecl.func_decl) Var.Map.t;
@@ -51,6 +64,8 @@ type context = {
   ctx_z3structs : Sort.sort StructName.Map.t;
   (* A map from Catala struct names to the corresponding Z3 sort, from which we
      can retrieve the constructor and the accessors *)
+  ctx_z3types : (int * Sort.sort) list;
+  ctx_head_values : (int, typed expr * typed expr * (typed expr, typed expr) Var.Map.t) Hashtbl.t;
   ctx_z3unit : Sort.sort * Expr.expr;
   ctx_z3duration : Sort.sort;
   ctx_z3defaults :
@@ -67,6 +82,17 @@ type context = {
   (* Shared translations of named value definitions. The saved constraints
      are reintroduced at each guarded use, so caching preserves both DAG
      sharing and the guard under which partial operations are valid. *)
+  ctx_capacity_limited : bool ref;
+  ctx_z3bounds : (int, int) Hashtbl.t;
+  ctx_calendar_pending : Expr.expr list ref;
+  ctx_environment_ids : (string, int) Hashtbl.t;
+  ctx_expression_ids : int ExpressionIdentity.t;
+  ctx_pending_relations : (Expr.expr * Expr.expr list * (context -> context * Expr.expr list)) Queue.t;
+  ctx_abstract_symbols : (int, unit) Hashtbl.t;
+  ctx_relation_graph : (int, int list list) Hashtbl.t;
+  ctx_abstract_calls : (string, Expr.expr * Expr.expr) Hashtbl.t;
+  ctx_lazy_relations : bool;
+  ctx_summary_cache : (string, Expr.expr * Expr.expr * int * Expr.expr list) Hashtbl.t;
   ctx_z3resolving : (typed expr) Var.Set.t;
   (* Definitions are followed by [translate_expr]. This set rejects an
      accidental recursive definition instead of silently replacing it with an
@@ -117,10 +143,24 @@ let add_z3enum (enum : EnumName.t) (sort : Sort.sort) (ctx : context) : context
     =
   { ctx with ctx_z3datatypes = EnumName.Map.add enum sort ctx.ctx_z3datatypes }
 
+let rec known_value_bound ctx value =
+  match Hashtbl.find_opt ctx.ctx_z3bounds (Z3.AST.get_id (Expr.ast_of_expr value)) with
+  | Some bound -> Some bound
+  | None when Z3.AST.get_ast_kind (Expr.ast_of_expr value) = Z3enums.APP_AST
+      && FuncDecl.get_decl_kind (Expr.get_func_decl value) = Z3enums.OP_DT_ACCESSOR ->
+    begin match Expr.get_args value with
+    | [parent] -> known_value_bound ctx parent
+    | _ -> None
+    end
+  | None -> None
+
 (** [add_z3matchsubst] adds the mapping between temporary variable [v] and the
     Z3 expression [e] representing an accessor application to the context **)
 let add_z3matchsubst (v : typed expr Var.t) (e : Expr.expr) (ctx : context) :
     context =
+  Option.iter (fun bound ->
+    Hashtbl.replace ctx.ctx_z3bounds (Z3.AST.get_id (Expr.ast_of_expr e)) bound)
+    (known_value_bound ctx e);
   { ctx with ctx_z3matchsubsts = Var.Map.add v e ctx.ctx_z3matchsubsts }
 
 (** [add_z3struct] adds the mapping between the Catala struct [s] and the
@@ -191,54 +231,6 @@ module DateEncoding = struct
     in
     sub ctx [add ctx [mul ctx [era; int ctx 146097]; doe]; int ctx 693901]
 
-  let date_to_civil ctx date =
-    let z = add ctx [date; int ctx 693901] in
-    let era = div ctx z (int ctx 146097) in
-    let doe = sub ctx [z; mul ctx [era; int ctx 146097]] in
-    let yoe =
-      div ctx
-        (add ctx
-           [ doe;
-             Arithmetic.mk_unary_minus ctx.ctx_z3 (div ctx doe (int ctx 1460));
-             div ctx doe (int ctx 36524);
-             Arithmetic.mk_unary_minus ctx.ctx_z3
-               (div ctx doe (int ctx 146096)) ])
-        (int ctx 365)
-    in
-    let year0 = add ctx [yoe; mul ctx [era; int ctx 400]] in
-    let doy =
-      sub ctx
-        [ doe;
-          add ctx
-            [ mul ctx [yoe; int ctx 365]; div ctx yoe (int ctx 4);
-              Arithmetic.mk_unary_minus ctx.ctx_z3
-                (div ctx yoe (int ctx 100)) ] ]
-    in
-    let mp =
-      div ctx (add ctx [mul ctx [int ctx 5; doy]; int ctx 2]) (int ctx 153)
-    in
-    let day =
-      add ctx
-        [ doy;
-          Arithmetic.mk_unary_minus ctx.ctx_z3
-            (div ctx (add ctx [mul ctx [int ctx 153; mp]; int ctx 2])
-               (int ctx 5));
-          int ctx 1 ]
-    in
-    let month =
-      add ctx
-        [ mp;
-          ite ctx (Arithmetic.mk_lt ctx.ctx_z3 mp (int ctx 10))
-            (int ctx 3) (int ctx (-9)) ]
-    in
-    let year =
-      add ctx
-        [ year0;
-          ite ctx (Arithmetic.mk_le ctx.ctx_z3 month (int ctx 2))
-            (int ctx 1) (int ctx 0) ]
-    in
-    year, month, day
-
   let is_leap ctx year =
     let eq0 x = Boolean.mk_eq ctx.ctx_z3 x (int ctx 0) in
     Boolean.mk_or ctx.ctx_z3
@@ -261,6 +253,22 @@ module DateEncoding = struct
         Arithmetic.mk_le ctx.ctx_z3 month (int ctx 12);
         Arithmetic.mk_ge ctx.ctx_z3 day (int ctx 1);
         Arithmetic.mk_le ctx.ctx_z3 day (days_in_month ctx year month) ]
+
+  let date_to_civil ctx date =
+    (* Exact ground instances of canonical calendar coordinates. The function
+       applications remain substitutable in reusable symbolic templates. *)
+    let integer = Arithmetic.Integer.mk_sort ctx.ctx_z3 in
+    let coordinate name =
+      let fn = FuncDecl.mk_func_decl_s ctx.ctx_z3 name [integer] integer in
+      Expr.mk_app ctx.ctx_z3 fn [date] in
+    let year = coordinate "bobcat_calendar_year" in
+    let month = coordinate "bobcat_calendar_month" in
+    let day = coordinate "bobcat_calendar_day" in
+    let relation = Boolean.mk_and ctx.ctx_z3
+        [valid_ymd ctx year month day;
+         Boolean.mk_eq ctx.ctx_z3 date (civil_to_date ctx year month day)] in
+    ctx.ctx_calendar_pending := relation :: !(ctx.ctx_calendar_pending);
+    year, month, day
 
   let duration_parts ctx duration =
     match Tuple.get_field_decls ctx.ctx_z3duration with
@@ -628,14 +636,19 @@ let rec json_of_z3model_expr
     (* Use the schema's object form. It is total over the admitted year
        domain, including year 0000, whereas the runtime string formatter and
        parser historically disagreed on zero-padding at that boundary. *)
-    let year, month, day = DateEncoding.date_to_civil ctx e in
-    let component value =
-      value |> eval_model model |> integer_string |> int_of_string
-    in
-    `Assoc
-      [ "year", `Int (component year);
-        "month", `Int (component month);
-        "day", `Int (component day) ]
+    (* Decode the solved serial value independently of any calendar selectors
+       mentioned by the query: unused selector applications are unconstrained. *)
+    let absolute = int_of_string (integer_string e) + 693901 in
+    let era = (if absolute < 0 then absolute - 146096 else absolute) / 146097 in
+    let doe = absolute - era * 146097 in
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365 in
+    let year = yoe + era * 400 in
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100) in
+    let mp = (5 * doy + 2) / 153 in
+    let day = doy - (153 * mp + 2) / 5 + 1 in
+    let month = mp + (if mp < 10 then 3 else -9) in
+    let year = year + (if month <= 2 then 1 else 0) in
+    `Assoc ["year", `Int year; "month", `Int month; "day", `Int day]
   | TLit TDuration ->
     let years, months, days = DateEncoding.duration_parts ctx e in
     let component value =
@@ -771,10 +784,11 @@ let rec translate_typ (ctx : context) (t : naked_typ) : context * Sort.sort =
   | TArrow _ -> ctx, fst ctx.ctx_z3unit
   | TArray ty -> find_or_create_array ctx ty
   | TVar var ->
-    ctx,
-    Sort.mk_uninterpreted_s ctx.ctx_z3
-      ("bobcat_type_" ^ Bindlib.name_of var
-       ^ string_of_int (Bindlib.uid_of var))
+    ctx, (match List.assoc_opt (Bindlib.uid_of var) ctx.ctx_z3types with
+      | Some sort -> sort
+      | None -> Sort.mk_uninterpreted_s ctx.ctx_z3
+          ("bobcat_type_" ^ Bindlib.name_of var
+           ^ string_of_int (Bindlib.uid_of var)))
   | TForAll binder ->
     let vars, _ = Bindlib.unmbind binder in
     let suffix =
@@ -1013,6 +1027,21 @@ and find_or_create_default (ctx : context) (ty : typ) :
   let ctx, value_sort = translate_typ ctx (Mark.remove ty) in
   find_or_create_default_sort ctx value_sort
 
+(* Instantiate a polymorphic formal's type from its concrete SMT argument.
+   Bindings are lexical and are restored when leaving the application. *)
+let rec bind_type_sort ctx ty sort =
+  let fields sort = List.hd (Datatype.get_accessors sort) in
+  match Mark.remove ty with
+  | TVar var -> { ctx with ctx_z3types =
+      (Bindlib.uid_of var, sort) :: List.remove_assoc (Bindlib.uid_of var) ctx.ctx_z3types }
+  | TArray ty -> bind_type_sort ctx ty (FuncDecl.get_range (List.nth (fields sort) 1))
+  | TOption ty -> bind_type_sort ctx ty
+      (FuncDecl.get_range (List.hd (List.nth (Datatype.get_accessors sort) 1)))
+  | TDefault ty -> bind_type_sort ctx ty (FuncDecl.get_range (List.nth (fields sort) 2))
+  | TTuple tys -> List.fold_left2 (fun ctx ty accessor ->
+      bind_type_sort ctx ty (FuncDecl.get_range accessor)) ctx tys (fields sort)
+  | _ -> ctx
+
 (** [translate_lit] returns the Z3 expression as a literal corresponding to
     [lit] **)
 let translate_lit (ctx : context) (l : lit) : Expr.expr =
@@ -1023,7 +1052,7 @@ let translate_lit (ctx : context) (l : lit) : Expr.expr =
     Arithmetic.Integer.mk_numeral_s ctx.ctx_z3 (Z.to_string n)
   | LRat r ->
     Arithmetic.Real.mk_numeral_s ctx.ctx_z3
-      (string_of_float (Runtime.decimal_to_float r))
+      (Q.to_string r)
   | LMoney m ->
     let z3_m = Runtime.money_to_cents m in
     Arithmetic.Integer.mk_numeral_s ctx.ctx_z3 (Z.to_string z3_m)
@@ -1068,29 +1097,210 @@ let find_or_create_funcdecl (ctx : context) (v : typed expr Var.t) (ty : typ) :
 let bounded_array_components ?limit ctx array =
   match List.hd (Datatype.get_accessors (Expr.get_sort array)) with
   | length :: elements ->
-    ( Expr.mk_app ctx.ctx_z3 length [array],
+    ( (match limit with
+       | Some 0 -> Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 0
+       | _ -> Expr.mk_app ctx.ctx_z3 length [array]),
       List.map
         (fun accessor -> Expr.mk_app ctx.ctx_z3 accessor [array])
         (match limit with None -> elements | Some n -> first_n n elements) )
   | [] -> failwith "[Z3 encoding] malformed bounded-list datatype"
 
-let expression_list_bound ctx expression =
-  let rec bound seen expression =
-    match Mark.remove expression with
-    | EArray values -> List.length values
-    | EVar var when not (Var.Set.mem var seen) ->
-      begin match Var.Map.find_opt var ctx.ctx_z3definitions with
-      | Some definition -> bound (Var.Set.add var seen) definition
-      | None -> ctx.ctx_symbolic_list_bound
-      end
-    | EAppOp { op = ((Map | Filter), _); args = [_; list]; _ }
-    | EAppOp { op = (Fold, _); args = [_; _; list]; _ } ->
-      bound seen list
-    | EAppOp { op = (Concat, _); args = [left; right]; _ } ->
-      min ctx.ctx_max_list_length (bound seen left + bound seen right)
-    | _ -> ctx.ctx_symbolic_list_bound
+(* Structural abstract interpretation. A size records an upper bound for every
+   nested list in a value. Functions and records retain their structure so
+   higher-order calls and record projections do not lose list growth. *)
+type size_value =
+  | Size of int
+  | SizeArray of int * size_value
+  | SizeFunction of int * (size_value list -> size_value)
+  | SizeStruct of size_value StructField.Map.t
+  | SizeTuple of size_value list
+
+let rec size_max = function
+  | Size n -> n
+  | SizeArray (n, element) -> max n (size_max element)
+  | SizeFunction _ -> 0
+  | SizeStruct fields -> StructField.Map.fold (fun _ v n -> max n (size_max v)) fields 0
+  | SizeTuple values -> List.fold_left (fun n v -> max n (size_max v)) 0 values
+
+let required_array_capacity ?(literals_only = false) ~decl_ctx ~input_ty ~input_bound ~input_var ~definitions body =
+  let maximum = ref (max 1 input_bound) in
+  (* Literal storage is independent of the input bound, including literals
+     in callbacks that become reachable only after an input list grows. *)
+  let named = List.fold_left (fun m (v, e) -> Var.Map.add v e m) Var.Map.empty definitions in
+  let seen = ref Var.Set.empty in
+  let rec literals e =
+    let children = match Mark.remove e with
+      | EVar v when not (Var.Set.mem v !seen) ->
+        seen := Var.Set.add v !seen; Option.to_list (Var.Map.find_opt v named)
+      | EAbs { binder; _ } -> let _, body = Bindlib.unmbind binder in [body]
+      | EArray xs -> maximum := max !maximum (List.length xs); xs
+      | EApp { f; args; _ } -> f :: args
+      | EAppOp { args; _ } | ETuple args -> args
+      | EIfThenElse { cond; etrue; efalse } -> [cond; etrue; efalse]
+      | EStruct { fields; _ } -> StructField.Map.values fields
+      | EStructAccess { e; _ } | ETupleAccess { e; _ } | EInj { e; _ }
+      | EAssert e | EPureDefault e | EErrorOnEmpty e -> [e]
+      | EMatch { e; cases; _ } -> e :: EnumConstructor.Map.values cases
+      | EDefault { excepts; just; cons } -> just :: cons :: excepts
+      | _ -> [] in
+    List.iter literals children
   in
-  min ctx.ctx_max_list_length (max 0 (bound Var.Set.empty expression))
+  literals body;
+  if literals_only then !maximum else
+  let serial = ref 0 in
+  let remember value = maximum := max !maximum (size_max value); value in
+  let rec key = function
+    | Size n -> "s" ^ string_of_int n
+    | SizeArray (n, element) -> "a" ^ string_of_int n ^ "[" ^ key element ^ "]"
+    | SizeFunction (id, _) -> "f" ^ string_of_int id
+    | SizeTuple xs -> "(" ^ String.concat "," (List.map key xs) ^ ")"
+    | SizeStruct fs -> "{" ^ String.concat ","
+        (List.map (fun (_, v) -> key v) (StructField.Map.bindings fs)) ^ "}" in
+  let rec join a b = match a, b with
+    | Size 0, value | value, Size 0 -> value
+    | SizeArray (n, a), SizeArray (m, b) -> SizeArray (max n m, join a b)
+    | SizeTuple a, SizeTuple b when List.length a = List.length b ->
+      SizeTuple (List.map2 join a b)
+    | SizeFunction (_, f), SizeFunction (_, g) ->
+      incr serial; SizeFunction (!serial, fun xs -> join (f xs) (g xs))
+    | SizeStruct a, SizeStruct b when StructField.Map.equal (fun _ _ -> true) a b -> SizeStruct (StructField.Map.mapi
+        (fun field a -> match StructField.Map.find_opt field b with
+          | Some b -> join a b | None -> a) a)
+    | _ -> Size (max (size_max a) (size_max b)) in
+  let rec input_shape ty = match Mark.remove ty with
+    | TArray element -> SizeArray (input_bound, input_shape element)
+    | TStruct name -> SizeStruct (StructField.Map.map input_shape
+        (StructName.Map.find name decl_ctx.ctx_structs))
+    | TTuple tys -> SizeTuple (List.map input_shape tys)
+    | TOption ty | TDefault ty -> input_shape ty
+    | TEnum name -> EnumConstructor.Map.fold (fun _ ty acc ->
+        join acc (input_shape ty)) (EnumName.Map.find name decl_ctx.ctx_enums) (Size 0)
+    | TVar _ | TForAll _ -> Size input_bound
+    | _ -> Size 0 in
+  let array = function
+    | SizeArray (n, element) -> n, element
+    | value -> let n = size_max value in n, Size n in
+  let apply fn args = match fn with
+    | SizeFunction (_, f) -> f args
+    | _ -> Size (List.fold_left (fun n x -> max n (size_max x)) (size_max fn) args) in
+  let rec eval env expression = remember (match Mark.remove expression with
+    | EVar var -> (match Var.Map.find_opt var env with Some v -> Lazy.force v | None -> input_shape (Shared_ast.Expr.ty expression))
+    | EAbs { binder; _ } ->
+      incr serial;
+      let id = !serial in
+      let memo = Hashtbl.create 7 in
+      SizeFunction (id, fun args ->
+        let signature = String.concat ";" (List.map key args) in
+        match Hashtbl.find_opt memo signature with
+        | Some v -> v
+        | None ->
+          let vars, body = Bindlib.unmbind binder in
+          let env = List.fold_left2 (fun env var value -> Var.Map.add var (lazy value) env)
+              env (Array.to_list vars) args in
+          let value = eval env body in
+          Hashtbl.add memo signature value; value)
+    | EApp { f; args; _ } -> apply (eval env f) (List.map (eval env) args)
+    | EStruct { fields; _ } -> SizeStruct (StructField.Map.map (eval env) fields)
+    | EStructAccess { e; field; _ } -> (match eval env e with
+        | SizeStruct fs -> StructField.Map.find field fs | v -> Size (size_max v))
+    | ETuple xs -> SizeTuple (List.map (eval env) xs)
+    | ETupleAccess { e; index; _ } -> (match eval env e with
+        | SizeTuple xs -> List.nth xs index | v -> Size (size_max v))
+    | EArray xs -> SizeArray (List.length xs,
+        List.fold_left (fun acc x -> join acc (eval env x)) (Size 0) xs)
+    | EAppOp { op = (Concat, _); args = [a;b]; _ } ->
+      let n, a = array (eval env a) and m, b = array (eval env b) in
+      if n > max_int - m then failwith "list capacity overflow";
+      SizeArray (n + m, join a b)
+    | EAppOp { op = ((Map | Filter | Find) as op, _); args = [fn; xs]; _ } ->
+      let n, element = array (eval env xs) in
+      let f = eval env fn in
+      let mapped = if n = 0 then Size 0 else apply f [element] in
+      (match op with
+       | Map -> SizeArray (n, mapped)
+       | Filter -> SizeArray (n, element)
+       | Find -> element
+       | _ -> assert false)
+    | EAppOp { op = (Fold, _); args = [fn; init; xs]; _ } ->
+      let n, element = array (eval env xs) in
+      let f = eval env fn in
+      let value = ref (eval env init) in
+      for _ = 1 to n do value := join !value (apply f [!value; element]) done;
+      !value
+    | EAppOp { op = (Reduce, _); args = [fn; xs]; _ } ->
+      let n, element = array (eval env xs) in
+      let f = eval env fn in
+      let value = ref element in
+      for _ = 2 to n do value := join !value (apply f [!value; element]) done;
+      !value
+    | EIfThenElse { cond; etrue; efalse } ->
+      ignore (eval env cond); join (eval env etrue) (eval env efalse)
+    | EMatch { e; cases; _ } ->
+      let subject = eval env e in
+      EnumConstructor.Map.fold (fun _ arm result -> join result (apply (eval env arm) [subject])) cases (Size 0)
+    | EInj { e; _ } | EPureDefault e | EErrorOnEmpty e -> eval env e
+    | EDefault { excepts; just; cons } ->
+      ignore (eval env just);
+      List.fold_left (fun value e -> join value (eval env e)) (eval env cons) excepts
+    | EAssert e -> ignore (eval env e); Size 0
+    | EAppOp { op = (ArrayAccess _, _); args = [xs]; _ } ->
+      snd (array (eval env xs))
+    | EAppOp { op = (Tag _, _); args = [inner]; _ } -> eval env inner
+    | EAppOp { args; _ } ->
+      let arguments = List.map (eval env) args in
+      let result = input_shape (Shared_ast.Expr.ty expression) in
+      (match result with Size 0 -> Size 0
+       | _ -> List.fold_left join result arguments)
+    | _ -> Size 0)
+  in
+  let all_definitions = ref Var.Map.empty in
+  let env = List.fold_left (fun env (var, definition) ->
+      Var.Map.add var (lazy (eval !all_definitions definition)) env)
+      (Var.Map.singleton input_var (lazy (input_shape input_ty))) definitions in
+  all_definitions := env;
+  ignore (eval env body);
+  !maximum
+
+(* Least fixed point of "contains a function" over the declaration graph.
+   Reverse edges propagate each positive fact once, including through cycles.
+   Repeated queries no longer unfold the same shared type DAG. *)
+let function_type_closure decl =
+  let positive = Hashtbl.create 127 in
+  let parents = Hashtbl.create 127 in
+  let pending = Queue.create () in
+  let mark node = if not (Hashtbl.mem positive node) then begin
+    Hashtbl.add positive node (); Queue.add node pending
+  end in
+  let rec visit parent ty = match Mark.remove ty with
+    | TArrow _ -> mark parent
+    | TStruct name -> edge parent (FunctionStruct name)
+    | TEnum name -> edge parent (FunctionEnum name)
+    | TOption ty | TDefault ty | TArray ty -> visit parent ty
+    | TTuple tys -> List.iter (visit parent) tys
+    | _ -> ()
+  and edge parent child =
+    Hashtbl.replace parents child
+      (parent :: Option.value ~default:[] (Hashtbl.find_opt parents child)) in
+  StructName.Map.iter (fun name fields ->
+    StructField.Map.iter (fun _ ty -> visit (FunctionStruct name) ty) fields)
+    decl.ctx_structs;
+  EnumName.Map.iter (fun name cases ->
+    EnumConstructor.Map.iter (fun _ ty -> visit (FunctionEnum name) ty) cases)
+    decl.ctx_enums;
+  while not (Queue.is_empty pending) do
+    let child = Queue.take pending in
+    List.iter mark (Option.value ~default:[] (Hashtbl.find_opt parents child))
+  done;
+  positive
+
+let rec type_contains_function ctx ty = match Mark.remove ty with
+  | TArrow _ -> true
+  | TStruct name -> Hashtbl.mem ctx.ctx_function_types (FunctionStruct name)
+  | TEnum name -> Hashtbl.mem ctx.ctx_function_types (FunctionEnum name)
+  | TOption ty | TDefault ty | TArray ty -> type_contains_function ctx ty
+  | TTuple tys -> List.exists (type_contains_function ctx) tys
+  | _ -> false
+
 
 let bounded_array_constructor array =
   List.hd (Datatype.get_constructors (Expr.get_sort array))
@@ -1129,6 +1339,208 @@ let external_runtime_name name =
 
 let _is_leap_year = Runtime.is_leap_year
 (* Replace with [Dates_calc.Dates.is_leap_year] when existing *)
+
+let expression_identity ctx expression =
+  match ExpressionIdentity.find_opt ctx.ctx_expression_ids expression with
+  | Some id -> id
+  | None ->
+    let id = ExpressionIdentity.length ctx.ctx_expression_ids in
+    ExpressionIdentity.add ctx.ctx_expression_ids expression id; id
+
+let symbolic_environment_key ctx definition =
+  (* Hash-cons the environment graph rather than serializing its transitive
+     closure at every call. Structural equality, not a digest, decides reuse. *)
+  let intern key = match Hashtbl.find_opt ctx.ctx_environment_ids key with
+    | Some id -> id
+    | None -> let id = Hashtbl.length ctx.ctx_environment_ids in
+      Hashtbl.add ctx.ctx_environment_ids key id; id in
+  let memo = Hashtbl.create 31 in
+  let rec variable var =
+    let uid = Bindlib.uid_of var in
+    match Hashtbl.find_opt memo uid with
+    | Some id -> id
+    | None ->
+      Hashtbl.add memo uid (intern ("cycle:" ^ string_of_int uid));
+      let tail = match Var.Map.find_opt var ctx.ctx_z3matchsubsts with
+        | Some value -> "value:" ^ string_of_int (Z3.AST.get_id (Expr.ast_of_expr value))
+        | None -> match Var.Map.find_opt var ctx.ctx_z3definitions with
+          | None -> "free"
+          | Some e -> "definition:" ^ string_of_int (expression_identity ctx e)
+            ^ ":" ^ expression e in
+      let id = intern (string_of_int uid ^ ":" ^ tail) in
+      Hashtbl.replace memo uid id; id
+  and expression e =
+    Shared_ast.Expr.free_vars e |> Var.Set.elements
+    |> List.map (fun var -> string_of_int (variable var)) |> String.concat "," in
+  string_of_int (intern ("environment:" ^ expression definition))
+
+let canonical_padding ctx sort =
+  Expr.mk_const_s ctx.ctx_z3
+    ("bobcat_padding_" ^ Digest.(to_hex (string (Sort.to_string sort)))) sort
+
+(* Commuting conversions for elimination of a computed value. Applying a
+   function or selecting a record field distributes through its control-flow
+   and default contexts, retaining the same guards and source branch tags. *)
+let rec map_computed_result transform new_ty (e : typed expr) : typed expr =
+  let mark = match Mark.get e with Typed { pos; _ } -> Typed { pos; ty = new_ty } in
+  let recur = map_computed_result transform in
+  match Mark.remove e with
+  | EIfThenElse { cond; etrue; efalse } ->
+    EIfThenElse { cond; etrue = recur new_ty etrue; efalse = recur new_ty efalse }, mark
+  | EMatch { e = subject; cases; name } ->
+    let cases = EnumConstructor.Map.map (fun arm -> match Mark.remove arm with
+      | EAbs { binder; pos; tys } ->
+        let vars, body = Bindlib.unmbind binder in
+        let body = recur new_ty body in
+        let binder = Bindlib.unbox (Bindlib.bind_mvar vars (Shared_ast.Expr.Box.lift (Shared_ast.Expr.rebox body))) in
+        let ty = TArrow (tys, new_ty), Mark.get new_ty in
+        let arm_mark = match Mark.get arm with Typed { pos; _ } -> Typed { pos; ty } in
+        EAbs { binder; pos; tys }, arm_mark
+      | _ -> failwith "computed result match requires lambda arms") cases in
+    EMatch { e = subject; cases; name }, mark
+  | EErrorOnEmpty inner ->
+    EErrorOnEmpty (recur (TDefault new_ty, Mark.get new_ty) inner), mark
+  | EPureDefault inner ->
+    let payload = match Mark.remove new_ty with TDefault ty -> ty | _ -> assert false in
+    EPureDefault (recur payload inner), mark
+  | EDefault { excepts; just; cons } ->
+    EDefault { excepts = List.map (recur new_ty) excepts; just; cons = recur new_ty cons }, mark
+  | EEmpty -> EEmpty, mark
+  | EAppOp { op = (Tag _, _) as op; args = [inner]; tys } ->
+    EAppOp { op; args = [recur new_ty inner]; tys }, mark
+  | _ -> transform new_ty e
+
+let computed_context (e : typed expr) = match Mark.remove e with
+  | EIfThenElse _ | EMatch _ | EErrorOnEmpty _ | EPureDefault _ | EDefault _ | EEmpty -> true
+  | EAppOp { op = (Tag _, _); _ } -> true
+  | _ -> false
+
+let project_computed base field name result_ty =
+  map_computed_result (fun ty e -> match Mark.remove e with
+    | EStruct { fields; _ } -> StructField.Map.find field fields
+    | _ -> let mark = match Mark.get e with Typed { pos; _ } -> Typed { pos; ty } in
+      EStructAccess { e; field; name }, mark) result_ty base
+
+let apply_computed head args result_ty =
+  map_computed_result (fun ty f ->
+    let mark = match Mark.get f with Typed { pos; _ } -> Typed { pos; ty } in
+    EApp { f; args; tys = [] }, mark) result_ty head
+
+(* Call-by-need head normalization. Bindlib gives lexical bindings unique
+   identities; each named definition is reduced once, together with the
+   environment needed by the resulting closure. No whole-body substitution. *)
+let resolve_value_head initial expression =
+  let state = ref initial in
+  let rec resolve seen e = match Mark.remove e with
+    | EVar var when not (Var.Set.mem var seen) ->
+      begin match Var.Map.find_opt var (!state).ctx_z3definitions with
+      | None -> e
+      | Some definition ->
+        begin match Hashtbl.find_opt (!state).ctx_head_values (Bindlib.uid_of var) with
+        | Some (original, value, environment) when original == definition ->
+          state := { !state with ctx_z3definitions =
+            Var.Map.union (fun _ current _ -> Some current) (!state).ctx_z3definitions environment };
+          value
+        | _ ->
+          let value = resolve (Var.Set.add var seen) definition in
+          Hashtbl.replace (!state).ctx_head_values (Bindlib.uid_of var)
+            (definition, value, (!state).ctx_z3definitions);
+          value
+        end
+      end
+    | EAppOp { op = (Tag _, _); args = [inner]; _ } -> resolve seen inner
+    | EApp { f; args; _ } ->
+      begin match Mark.remove (resolve seen f) with
+      | EAbs { binder; _ } when Bindlib.mbinder_arity binder = List.length args ->
+        let vars, body = Bindlib.unmbind binder in
+        state := List.fold_left2 (fun ctx var arg ->
+          { ctx with ctx_z3definitions = Var.Map.add var arg ctx.ctx_z3definitions })
+          !state (Array.to_list vars) args;
+        resolve seen body
+      | _ -> e
+      end
+    | EStructAccess { e = base; field; name } ->
+      let base = resolve seen base in
+      begin match Mark.remove base with
+      | EStruct { fields; _ } -> resolve seen (StructField.Map.find field fields)
+      | _ when computed_context base -> project_computed base field name (Shared_ast.Expr.ty e)
+      | _ -> e
+      end
+    | _ -> e in
+  let value = resolve Var.Set.empty expression in
+  !state, value
+
+let expression_list_bound ctx expression =
+  let rec has_lists seen ty = match Mark.remove ty with
+    | TArray _ -> true
+    | TStruct name when not (List.mem ("s" ^ StructName.to_string name) seen) ->
+      let seen = ("s" ^ StructName.to_string name) :: seen in
+      StructField.Map.exists (fun _ ty -> has_lists seen ty)
+        (StructName.Map.find name ctx.ctx_decl.ctx_structs)
+    | TEnum name when not (List.mem ("e" ^ EnumName.to_string name) seen) ->
+      let seen = ("e" ^ EnumName.to_string name) :: seen in
+      EnumConstructor.Map.exists (fun _ ty -> has_lists seen ty)
+        (EnumName.Map.find name ctx.ctx_decl.ctx_enums)
+    | TOption ty | TDefault ty -> has_lists seen ty
+    | TTuple tys -> List.exists (has_lists seen) tys
+    | TVar _ | TForAll _ -> true
+    | _ -> false in
+  let rec bound ctx seen expression =
+    let (Typed { ty; _ }) = Mark.get expression in
+    if not (has_lists [] ty) then 0 else
+    match Mark.remove expression with
+    | EArray values ->
+      List.fold_left (fun n e -> max n (bound ctx seen e)) (List.length values) values
+    | EVar var when not (Var.Set.mem var seen) ->
+      begin match Var.Map.find_opt var ctx.ctx_z3matchsubsts with
+      | Some value -> Option.value ~default:ctx.ctx_max_list_length
+          (known_value_bound ctx value)
+      | None -> match Var.Map.find_opt var ctx.ctx_z3valuecache with
+        | Some (value, _) -> Option.value ~default:ctx.ctx_max_list_length
+            (known_value_bound ctx value)
+        | None -> match Var.Map.find_opt var ctx.ctx_z3definitions with
+        | Some definition -> bound ctx (Var.Set.add var seen) definition
+        | None when Var.Set.mem var ctx.ctx_z3freevars -> ctx.ctx_symbolic_list_bound
+        | None -> ctx.ctx_max_list_length
+      end
+    | EStructAccess { e; _ } ->
+      let next, head = resolve_value_head ctx expression in
+      if head != expression then bound next seen head else bound ctx seen e
+    | EApp _ ->
+      let next, head = resolve_value_head ctx expression in
+      if head != expression then bound next seen head else ctx.ctx_max_list_length
+    | ETupleAccess { e; _ }
+    | EInj { e; _ } | EErrorOnEmpty e | EPureDefault e -> bound ctx seen e
+    | EAppOp { op = (Tag _, _); args = [e]; _ } -> bound ctx seen e
+    | EStruct { fields; _ } ->
+      StructField.Map.fold (fun _ e n -> max n (bound ctx seen e)) fields 0
+    | ETuple values -> List.fold_left (fun n e -> max n (bound ctx seen e)) 0 values
+    | EAppOp { op = (Filter, _); args = [_; list]; _ } -> bound ctx seen list
+    | EAppOp { op = (Map, _); args = [_; list]; _ } ->
+      (match Mark.remove ty with
+       | TArray element_ty when not (has_lists [] element_ty) -> bound ctx seen list
+       | _ -> ctx.ctx_max_list_length)
+    | EAppOp { op = (Concat, _); args = [left; right]; _ } ->
+      bound ctx seen left + bound ctx seen right
+    | EIfThenElse { etrue; efalse; _ } -> max (bound ctx seen etrue) (bound ctx seen efalse)
+    | EDefault { excepts; cons; _ } ->
+      List.fold_left (fun n e -> max n (bound ctx seen e)) (bound ctx seen cons) excepts
+    | EEmpty -> 0
+    | _ -> ctx.ctx_max_list_length
+  in
+  min ctx.ctx_max_list_length (max 0 (bound ctx Var.Set.empty expression))
+
+let encoded_list_bound ctx expression array =
+  min (expression_list_bound ctx expression)
+    (Option.value ~default:ctx.ctx_max_list_length
+       (known_value_bound ctx array))
+
+let guard_new_constraints ctx previous guard =
+  let rec delta = function
+    | tail when tail == previous -> []
+    | c :: rest -> Boolean.mk_implies ctx.ctx_z3 guard c :: delta rest
+    | [] -> failwith "guarded constraint accumulator lost its tail" in
+  { ctx with ctx_z3constraints = delta ctx.ctx_z3constraints @ previous }
 
 (** [translate_op] returns the Z3 expression corresponding to the application of
     [op] to the arguments [args] **)
@@ -1398,7 +1810,10 @@ let rec translate_op :
     let ctx, array = translate_expr ctx e1 in
     let accessors = List.hd (Datatype.get_accessors (Expr.get_sort array)) in
     begin match accessors with
-    | length :: _ -> ctx, Expr.mk_app ctx.ctx_z3 length [array]
+    | length :: _ ->
+      ctx, (if encoded_list_bound ctx e1 array = 0 then
+              Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 0
+            else Expr.mk_app ctx.ctx_z3 length [array])
     | [] -> failwith "[Z3 encoding] malformed bounded-list datatype"
     end
   | ToRat_int, [e] ->
@@ -1411,16 +1826,44 @@ let rec translate_op :
     ctx, Arithmetic.mk_div ctx.ctx_z3 cents hundred
   | _ -> ill_formed ()
 
+and needs_value_summary expression =
+  let rec atomic expression = match Mark.remove expression with
+    | EVar _ | ELit _ | EExternal _ | EPos _ | EEmpty -> true
+    | EStructAccess { e; _ } | ETupleAccess { e; _ }
+    | EInj { e; _ } | EPureDefault e -> atomic e
+    | EStruct { fields; _ } -> StructField.Map.for_all (fun _ -> atomic) fields
+    | EArray values | ETuple values -> List.for_all atomic values
+    | EAppOp { op = ((Map | Filter | Find | Fold | Reduce | Concat), _); _ } -> false
+    | EAppOp { args; _ } -> List.for_all atomic args
+    | _ -> false in
+  not (atomic expression)
+
 (** [translate_expr] translate the expression [vc] to its corresponding Z3
     expression **)
 and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
+  let previous = !(ctx.ctx_calendar_pending) in
+  Fun.protect ~finally:(fun () -> ctx.ctx_calendar_pending := previous) (fun () ->
+  let ctx, value = translate_expr_body ctx vc in
+  let rec flush ctx = function
+    | tail when tail == previous -> ctx
+    | relation :: rest -> flush (add_z3constraint relation ctx) rest
+    | [] -> failwith "calendar constraint accumulator lost its tail" in
+  let ctx = flush ctx !(ctx.ctx_calendar_pending) in
+  let id = Z3.AST.get_id (Expr.ast_of_expr value) in
+  let bound = expression_list_bound ctx vc in
+  let bound = match Hashtbl.find_opt ctx.ctx_z3bounds id with
+    | Some former -> min former bound | None -> bound in
+  Hashtbl.replace ctx.ctx_z3bounds id bound;
+  ctx, value)
+
+and translate_expr_body (ctx : context) (vc : typed expr) : context * Expr.expr =
   let translate_match_arm
       (head : Expr.expr)
       (ctx : context)
       (e : 'm expr * FuncDecl.func_decl list) : context * Expr.expr =
     let e, accessors = e in
     match Mark.remove e with
-    | EAbs { binder; _ } ->
+    | EAbs { binder; tys; _ } ->
       (* Create a fresh Catala variable to substitue and obtain the body *)
       let fresh_v = Var.make "arm!tmp" in
       let fresh_e = EVar fresh_v in
@@ -1430,10 +1873,13 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
       let proj = Expr.mk_app ctx.ctx_z3 accessor [head] in
       (* The fresh variable should be substituted by a projection into the enum
          in the body, we add this to the context *)
+      let former_types = ctx.ctx_z3types in
+      let ctx = bind_type_sort ctx (List.hd tys) (Expr.get_sort proj) in
       let ctx = add_z3matchsubst fresh_v proj ctx in
 
       let body = Bindlib.msubst binder [| fresh_e |] in
-      translate_expr ctx body
+      let ctx, value = translate_expr ctx body in
+      { ctx with ctx_z3types = former_types }, value
     (* Invariant: Catala match arms are always lambda*)
     | _ -> failwith "[Z3 encoding] : Arms branches inside VCs should be lambdas"
   in
@@ -1451,6 +1897,11 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
           ctx_z3constraints = constraints @ ctx.ctx_z3constraints },
         value
       | None -> begin match Var.Map.find_opt v ctx.ctx_z3definitions with
+      | Some definition when ctx.ctx_lazy_relations && needs_value_summary definition
+          && not (type_contains_function ctx (Shared_ast.Expr.ty definition)) ->
+        let key = "definition:" ^ string_of_int (Bindlib.uid_of v) ^ ":"
+          ^ symbolic_environment_key ctx definition in
+        suspend_value ctx key definition
       | Some definition ->
         if Var.Set.mem v ctx.ctx_z3resolving then
           failwith
@@ -1472,10 +1923,11 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
               failwith
                 "[Z3 encoding] definition constraint accumulator lost its tail"
           in
-          let constraints =
-            new_constraints [] ctx.ctx_z3constraints
-          in
+          let constraints = new_constraints [] ctx.ctx_z3constraints in
+          let relation = Boolean.mk_and ctx.ctx_z3 constraints in
+          let constraints = [relation] in
           { ctx with
+            ctx_z3constraints = relation :: previous_constraints;
             ctx_z3resolving = former_resolving;
             ctx_z3valuecache =
               Var.Map.add v (value, constraints) ctx.ctx_z3valuecache },
@@ -1510,6 +1962,9 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     in
     ctx, Expr.mk_app ctx.ctx_z3 constructor values
   | EStructAccess { e; field; name } ->
+    let next, demanded =
+      if ctx.ctx_allow_fatal_dummy then resolve_value_head ctx vc else ctx, vc in
+    if demanded != vc then translate_expr next demanded else
     let ctx, z3_struct = find_or_create_struct ctx name in
     (* This datatype should have only one constructor, corresponding to
        mk_struct. The accessors of this constructor correspond to the field
@@ -1565,7 +2020,10 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     let members = enum_z3_members ctx enum z3_enum in
     let ctx, z3_arms =
       List.fold_left_map
-        (translate_match_arm z3_arg)
+        (fun ctx (selected, arm) ->
+          let previous = ctx.ctx_z3constraints in
+          let ctx, value = translate_match_arm z3_arg ctx arm in
+          guard_new_constraints ctx previous selected, value)
         ctx
         (EnumConstructor.Map.bindings cases
         |> List.map (fun (constructor, arm) ->
@@ -1575,7 +2033,10 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
                     EnumConstructor.equal candidate constructor)
                |> fun (_, _, _, accessors) -> accessors
              in
-             arm, accessors))
+             let recognizer = members
+               |> List.find (fun (candidate, _, _, _) -> EnumConstructor.equal candidate constructor)
+               |> fun (_, _, recognizer, _) -> recognizer in
+             Expr.mk_app ctx.ctx_z3 recognizer [z3_arg], (arm, accessors)))
     in
     let guarded_arms =
       List.map2
@@ -1629,7 +2090,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     let constructor = List.hd (Datatype.get_constructors sort) in
     let padding =
       List.init (ctx.ctx_max_list_length - List.length encoded) (fun _ ->
-        Expr.mk_fresh_const ctx.ctx_z3 "bobcat_array_padding" element_sort)
+        canonical_padding ctx element_sort)
     in
     let length =
       Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 (List.length encoded)
@@ -1640,12 +2101,10 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
   | EAppOp { op = (Map, _); args = [fn; list]; _ } ->
     let ctx, array = translate_expr ctx list in
     let length, elements =
-      bounded_array_components ~limit:(expression_list_bound ctx list) ctx array
+      bounded_array_components ~limit:(encoded_list_bound ctx list array) ctx array
     in
     let ctx, mapped =
-      List.fold_left_map
-        (fun ctx element -> translate_function_value ctx fn [element])
-        ctx elements
+      translate_bounded_function ctx fn length elements false
     in
     let (Typed { ty; _ }) = Mark.get vc in
     let result_element_ty =
@@ -1662,19 +2121,22 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     let constructor = List.hd (Datatype.get_constructors result_sort) in
     let padding =
       List.init (ctx.ctx_max_list_length - List.length mapped) (fun _ ->
-        Expr.mk_fresh_const ctx.ctx_z3 "bobcat_map_padding"
+        canonical_padding ctx
           result_element_sort)
     in
-    ctx, Expr.mk_app ctx.ctx_z3 constructor (length :: mapped @ padding)
+    let result = Expr.mk_app ctx.ctx_z3 constructor (length :: mapped @ padding) in
+    let bound = List.fold_left (fun bound element ->
+      max bound (Option.value ~default:ctx.ctx_max_list_length (known_value_bound ctx element)))
+      (encoded_list_bound ctx list array) mapped in
+    Hashtbl.replace ctx.ctx_z3bounds (Z3.AST.get_id (Expr.ast_of_expr result)) bound;
+    ctx, result
   | EAppOp { op = (Filter, _); args = [fn; list]; _ } ->
     let ctx, array = translate_expr ctx list in
     let length, elements =
-      bounded_array_components ~limit:(expression_list_bound ctx list) ctx array
+      bounded_array_components ~limit:(encoded_list_bound ctx list array) ctx array
     in
     let ctx, predicates =
-      List.fold_left_map
-        (fun ctx element -> translate_function_value ctx fn [element])
-        ctx elements
+      translate_bounded_function ctx fn length elements false
     in
     let zero = Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 0 in
     let one = Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 1 in
@@ -1695,12 +2157,14 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     let element_sort =
       match elements with
       | element :: _ -> Expr.get_sort element
-      | [] -> failwith "[Z3 encoding] zero list bound has no element sort"
+      | [] ->
+        let accessor = List.nth (List.hd (Datatype.get_accessors (Expr.get_sort array))) 1 in
+        FuncDecl.get_range accessor
     in
     let packed =
       List.init ctx.ctx_max_list_length (fun output_index ->
         let fallback =
-          Expr.mk_fresh_const ctx.ctx_z3 "bobcat_filter_padding" element_sort
+          canonical_padding ctx element_sort
         in
         List.fold_right2
           (fun element (prefix, selected) fallback ->
@@ -1719,12 +2183,10 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
   | EAppOp { op = (Find, _); args = [fn; list]; _ } ->
     let ctx, array = translate_expr ctx list in
     let length, elements =
-      bounded_array_components ~limit:(expression_list_bound ctx list) ctx array
+      bounded_array_components ~limit:(encoded_list_bound ctx list array) ctx array
     in
     let ctx, predicates =
-      List.fold_left_map
-        (fun ctx element -> translate_function_value ctx fn [element])
-        ctx elements
+      translate_bounded_function ctx fn length elements true
     in
     let selected =
       List.map2
@@ -1750,7 +2212,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     begin match constructors with
     | absent :: present :: _ ->
       let fallback =
-        Expr.mk_fresh_const ctx.ctx_z3 "bobcat_find_padding" payload_sort
+        canonical_padding ctx payload_sort
       in
       let value =
         List.fold_right
@@ -1772,7 +2234,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
   | EAppOp { op = (Reduce, _); args = [fn; list]; _ } ->
     let ctx, array = translate_expr ctx list in
     let length, elements =
-      bounded_array_components ~limit:(expression_list_bound ctx list) ctx array
+      bounded_array_components ~limit:(encoded_list_bound ctx list array) ctx array
     in
     let (Typed { ty; _ }) = Mark.get vc in
     let payload_ty =
@@ -1789,6 +2251,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
       let ctx, reduced =
         List.fold_left
           (fun (ctx, accumulator) (index, element) ->
+            let previous = ctx.ctx_z3constraints in
             let ctx, next =
               translate_function_value ctx fn [accumulator; element]
             in
@@ -1796,6 +2259,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
               Arithmetic.mk_gt ctx.ctx_z3 length
                 (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 index)
             in
+            let ctx = guard_new_constraints ctx previous included in
             ctx, Boolean.mk_ite ctx.ctx_z3 included next accumulator)
           (ctx, first)
           (List.mapi (fun index element -> index + 1, element) rest)
@@ -1836,7 +2300,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
       List.mapi
         (fun output_index left_element ->
           let fallback =
-            Expr.mk_fresh_const ctx.ctx_z3 "bobcat_concat_padding"
+            canonical_padding ctx
               element_sort
           in
           let from_right =
@@ -1878,10 +2342,11 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
     let ctx, accumulator = translate_expr ctx init in
     let ctx, array = translate_expr ctx list in
     let length, elements =
-      bounded_array_components ~limit:(expression_list_bound ctx list) ctx array
+      bounded_array_components ~limit:(encoded_list_bound ctx list array) ctx array
     in
     List.fold_left
       (fun (ctx, accumulator) (index, element) ->
+        let previous = ctx.ctx_z3constraints in
         let ctx, next =
           translate_function_value ctx fn [accumulator; element]
         in
@@ -1889,39 +2354,13 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
           Arithmetic.mk_gt ctx.ctx_z3 length
             (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 index)
         in
+        let ctx = guard_new_constraints ctx previous present in
         ctx, Boolean.mk_ite ctx.ctx_z3 present next accumulator)
       (ctx, accumulator) (List.mapi (fun i e -> i, e) elements)
   | EAppOp { op; args; _ } -> translate_op ctx op args
   | EApp { f = head; args; _ } ->
-    let rec resolve_head seen expression =
-      match Mark.remove expression with
-      | EVar var ->
-        if Var.Set.mem var seen then expression
-        else
-          Option.fold ~none:expression
-            ~some:(resolve_head (Var.Set.add var seen))
-            (Var.Map.find_opt var ctx.ctx_z3definitions)
-      | EAppOp { op = (Tag _, _); args = [inner]; _ } ->
-        resolve_head seen inner
-      | EApp { f; args; _ } ->
-        begin match Mark.remove (resolve_head seen f) with
-        | EAbs { binder; _ }
-          when Bindlib.mbinder_arity binder = List.length args ->
-          Bindlib.msubst binder (Array.of_list (List.map Mark.remove args))
-          |> resolve_head seen
-        | _ -> expression
-        end
-      | EStructAccess { e; field; _ } ->
-        begin match Mark.remove (resolve_head seen e) with
-        | EStruct { fields; _ } ->
-          StructField.Map.find_opt field fields
-          |> Option.fold ~none:expression ~some:(resolve_head seen)
-        | _ -> expression
-        end
-      | _ -> expression
-    in
-    let resolve_head = resolve_head Var.Set.empty in
-    let head = resolve_head head in
+    let lexical_let = match Mark.remove head with EAbs _ -> true | _ -> false in
+    let ctx, head = resolve_value_head ctx head in
     (
     match Mark.remove head with
     | EVar v ->
@@ -1988,6 +2427,9 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
       begin match runtime_module, function_name, args with
       | ( ("List_internal" | "List_en" | "List_fr"),
           ("sequence" | "séquence"), [start; stop] ) ->
+        (* Scalar endpoints need an additional output-length bound. Retain SAT
+           witnesses, but never certify input-bounded UNSAT using that bound. *)
+        ctx.ctx_capacity_limited := true;
         let ctx, start = translate_expr ctx start in
         let ctx, stop = translate_expr ctx stop in
         let zero = Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 0 in
@@ -2040,7 +2482,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
         begin match Datatype.get_constructors option_sort with
         | absent :: present :: _ ->
           let fallback =
-            Expr.mk_fresh_const ctx.ctx_z3 "bobcat_nth_padding" payload_sort
+            canonical_padding ctx payload_sort
           in
           let selected =
             List.mapi
@@ -2086,17 +2528,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
           let ctx =
             add_z3constraint (DateEncoding.valid_ymd ctx year month day) ctx
           in
-          let value =
-            Expr.mk_fresh_const ctx.ctx_z3 "bobcat_date_of_ymd"
-              (Arithmetic.Integer.mk_sort ctx.ctx_z3)
-          in
-          let ctx =
-            add_z3constraint
-              (Boolean.mk_eq ctx.ctx_z3 value
-                 (DateEncoding.civil_to_date ctx year month day))
-              ctx
-          in
-          ctx, value
+          ctx, DateEncoding.civil_to_date ctx year month day
         end
       | ( ("Date_en" | "Date_fr"),
           ("get_year" | "accès_année"), [date] ) ->
@@ -2162,22 +2594,36 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
           ("[Z3 encoding] unsupported external function " ^ runtime_module
            ^ "." ^ function_name)
       end
-    | EAbs { binder; _ } ->
-      let vars, _ = Bindlib.unmbind binder in
-      if Array.length vars <> List.length args then
-        failwith "[Z3 encoding] function arity mismatch"
-      else
-        let expr =
-          Bindlib.msubst binder (Array.of_list (List.map Mark.remove args))
-        in
-        translate_expr ctx expr
+    | EAbs { binder; tys; _ } ->
+      let (Typed { ty = result_ty; _ }) = Mark.get vc in
+      if lexical_let || type_contains_function ctx result_ty
+         || List.exists (fun arg -> let (Typed { ty; _ }) = Mark.get arg in
+           type_contains_function ctx ty) args then begin
+        let vars, body = Bindlib.unmbind binder in
+        let former_definitions = ctx.ctx_z3definitions in
+        let former_types = ctx.ctx_z3types in
+        let ctx = List.fold_left2 (fun ctx ty arg ->
+          let (Typed { ty = actual_ty; _ }) = Mark.get arg in
+          let ctx, sort = translate_typ ctx (Mark.remove actual_ty) in
+          bind_type_sort ctx ty sort) ctx tys args in
+        let ctx = List.fold_left2 (fun ctx var arg ->
+          { ctx with ctx_z3definitions = Var.Map.add var arg ctx.ctx_z3definitions })
+          ctx (Array.to_list vars) args in
+        let ctx, result = translate_expr ctx body in
+        { ctx with ctx_z3types = former_types; ctx_z3definitions = former_definitions }, result
+      end else begin
+        let ctx, arguments = List.fold_left_map translate_expr ctx args in
+        translate_function_value ctx head arguments
+      end
+    | _ when computed_context head ->
+      translate_expr ctx (apply_computed head args (Shared_ast.Expr.ty vc))
     | _ ->
       let detail =
         match Mark.remove head with
         | EStructAccess { e = ((EVar var, _) as base); _ } ->
           if Var.Map.mem var ctx.ctx_z3definitions then
             let kind =
-              match Mark.remove (resolve_head base) with
+              match Mark.remove (snd (resolve_value_head ctx base)) with
               | EVar _ -> "variable" | EApp _ -> "application"
               | EStruct _ -> "struct" | EDefault _ -> "default"
               | EErrorOnEmpty _ -> "error-on-empty" | EIfThenElse _ -> "if"
@@ -2194,6 +2640,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
         "[Z3 encoding] unsupported function head%s: %a" detail
         Shared_ast.Expr.format
         (Shared_ast.Expr.untype head |> Shared_ast.Expr.unbox))
+  | EAssert _ when ctx.ctx_allow_fatal_dummy -> ctx, snd ctx.ctx_z3unit
   | EAssert e -> translate_expr ctx e
   | EFatalError _ when ctx.ctx_allow_fatal_dummy ->
     (* Guarded reachability separately asserts that the path leading to this
@@ -2201,7 +2648,7 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
        their ordinary value sort while that path condition is assembled. *)
     let (Typed { ty; _ }) = Mark.get vc in
     let ctx, sort = translate_typ ctx (Mark.remove ty) in
-    ctx, Expr.mk_fresh_const ctx.ctx_z3 "bobcat_fatal_value" sort
+    ctx, Expr.mk_const_s ctx.ctx_z3 ("bobcat_fatal_" ^ string_of_int (Sort.get_id sort)) sort
   | EFatalError _ -> failwith "[Z3 encoding] EFatalError unsupported"
   | EDefault { excepts; just; cons } ->
     let (Typed { ty; _ }) = Mark.get vc in
@@ -2279,8 +2726,12 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
        be some interesting optimization in the future about when to split this
        node/bubble up the if_then_else, but this is left as future work *)
     let ctx, z3_if = translate_expr ctx e_if in
+    let previous = ctx.ctx_z3constraints in
     let ctx, z3_then = translate_expr ctx e_then in
+    let ctx = guard_new_constraints ctx previous z3_if in
+    let previous = ctx.ctx_z3constraints in
     let ctx, z3_else = translate_expr ctx e_else in
+    let ctx = guard_new_constraints ctx previous (Boolean.mk_not ctx.ctx_z3 z3_if) in
     ctx, Boolean.mk_ite ctx.ctx_z3 z3_if z3_then z3_else
   | EEmpty ->
     let (Typed { ty; _ }) = Mark.get vc in
@@ -2320,31 +2771,140 @@ and translate_expr (ctx : context) (vc : typed expr) : context * Expr.expr =
   | EBad -> failwith "[Z3 encoding] EBad unsupported"
   | _ -> .
 
+and translate_bounded_function ctx fn length elements short_circuit =
+  let searching = ref (Boolean.mk_true ctx.ctx_z3) in
+  List.fold_left_map (fun ctx (index, element) ->
+    let present = Arithmetic.mk_gt ctx.ctx_z3 length
+        (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 index) in
+    let active = Boolean.mk_and ctx.ctx_z3 [present; !searching] in
+    let previous = ctx.ctx_z3constraints in
+    let ctx, value = translate_function_value ctx fn [element] in
+    let ctx = guard_new_constraints ctx previous active in
+    if short_circuit then searching := Boolean.mk_and ctx.ctx_z3
+        [!searching; Boolean.mk_not ctx.ctx_z3 value];
+    ctx, value) ctx (List.mapi (fun i e -> i, e) elements)
+
 and translate_function_value ctx fn arguments =
   let rec resolve seen fn =
     match Mark.remove fn with
-    | EVar var ->
-      if Var.Set.mem var seen then fn
-      else
-        begin match Var.Map.find_opt var ctx.ctx_z3definitions with
-        | Some definition -> resolve (Var.Set.add var seen) definition
-        | None -> fn
-        end
+    | EVar var when not (Var.Set.mem var seen) ->
+      begin match Var.Map.find_opt var ctx.ctx_z3definitions with
+      | Some definition -> resolve (Var.Set.add var seen) definition
+      | None -> fn
+      end
     | _ -> fn
   in
-  match Mark.remove (resolve Var.Set.empty fn) with
-  | EAbs { binder; _ }
-    when Bindlib.mbinder_arity binder = List.length arguments ->
+  let fn = resolve Var.Set.empty fn in
+  if ctx.ctx_lazy_relations then translate_abstract_call ctx fn arguments else
+  let bounds = List.map (fun value ->
+      Option.value ~default:ctx.ctx_max_list_length (known_value_bound ctx value)) arguments in
+  (* Specialize the finite representation by argument shape, not argument
+     value. All applications of this lexical function at those bounds share
+     the same SMT definition. Catala functions are acyclic; Z3's definition API
+     is used without introducing recursive source semantics or quantifiers. *)
+  let key = string_of_int (expression_identity ctx fn) ^ ":"
+    ^ symbolic_environment_key ctx fn ^ ":"
+    ^ String.concat "," (List.map2 (fun arg bound ->
+        string_of_int (Sort.get_id (Expr.get_sort arg)) ^ "/" ^ string_of_int bound)
+        arguments bounds) in
+  let instantiate ctx (value, validity, bound, formals) =
+    let result = Expr.substitute value formals arguments in
+    let validity = Expr.substitute validity formals arguments in
+    Hashtbl.replace ctx.ctx_z3bounds (Z3.AST.get_id (Expr.ast_of_expr result)) bound;
+    add_z3constraint validity ctx, result
+  in
+  match Hashtbl.find_opt ctx.ctx_summary_cache key with
+  | Some summary -> instantiate ctx summary
+  | None ->
+    match Mark.remove fn with
+    | EAbs { binder; tys; _ }
+      when Bindlib.mbinder_arity binder = List.length arguments ->
+      let vars, body = Bindlib.unmbind binder in
+      let former_types = ctx.ctx_z3types in
+      let ctx = List.fold_left2 (fun ctx ty arg ->
+        bind_type_sort ctx ty (Expr.get_sort arg)) ctx tys arguments in
+      let former_substs = ctx.ctx_z3matchsubsts in
+      let former_values = ctx.ctx_z3valuecache in
+      let ctx = { ctx with ctx_z3valuecache = Var.Map.empty } in
+      let previous_constraints = ctx.ctx_z3constraints in
+      let formals = List.map2 (fun argument bound ->
+          let formal = Expr.mk_fresh_const ctx.ctx_z3 "formal_argument" (Expr.get_sort argument) in
+          Hashtbl.replace ctx.ctx_z3bounds (Z3.AST.get_id (Expr.ast_of_expr formal)) bound;
+          formal) arguments bounds in
+      let ctx = List.fold_left2
+          (fun ctx var argument -> add_z3matchsubst var argument ctx)
+          ctx (Array.to_list vars) formals in
+      let ctx, value = translate_expr ctx body in
+      let rec delta = function
+        | tail when tail == previous_constraints -> []
+        | c :: rest -> c :: delta rest
+        | [] -> failwith "summary constraint accumulator lost its tail" in
+      let relation = Boolean.mk_and ctx.ctx_z3 (delta ctx.ctx_z3constraints) in
+      (* A template is a quantifier-free DAG. Capture-avoiding substitution
+         instantiates its formal arguments while Z3 hash-consing preserves
+         shared subexpressions. No recursive-function theory is required. *)
+      let bound = Option.value ~default:ctx.ctx_max_list_length (known_value_bound ctx value) in
+      let summary = value, relation, bound, formals in
+      Hashtbl.add ctx.ctx_summary_cache key summary;
+      instantiate { ctx with ctx_z3types = former_types;
+                             ctx_z3matchsubsts = former_substs;
+                             ctx_z3valuecache = former_values;
+                             ctx_z3constraints = previous_constraints } summary
+    | _ -> failwith "[Z3 encoding] list operator expected a lambda"
+
+and translate_abstract_call ctx fn arguments =
+  let key = "call:" ^ string_of_int (expression_identity ctx fn) ^ ":"
+    ^ symbolic_environment_key ctx fn ^ ":"
+    ^ String.concat "," (List.map (fun arg ->
+        string_of_int (Z3.AST.get_id (Expr.ast_of_expr arg))) arguments) in
+  match Mark.remove fn with
+  | EAbs { binder; tys; _ } when Bindlib.mbinder_arity binder = List.length arguments ->
     let vars, body = Bindlib.unmbind binder in
-    let former_substs = ctx.ctx_z3matchsubsts in
-    let ctx =
-      List.fold_left2
-        (fun ctx var argument -> add_z3matchsubst var argument ctx)
-        ctx (Array.to_list vars) arguments
-    in
-    let ctx, result = translate_expr ctx body in
-    { ctx with ctx_z3matchsubsts = former_substs }, result
-  | _ -> failwith "[Z3 encoding] list operator expected a lambda"
+    let work = List.fold_left2 (fun ctx ty arg ->
+      bind_type_sort ctx ty (Expr.get_sort arg)) ctx tys arguments in
+    let work = List.fold_left2 (fun ctx var arg -> add_z3matchsubst var arg ctx)
+      work (Array.to_list vars) arguments in
+    let work, result = suspend_value work key body in
+    { work with ctx_z3types = ctx.ctx_z3types;
+                ctx_z3matchsubsts = ctx.ctx_z3matchsubsts }, result
+  | _ -> failwith "[Z3 encoding] abstract call expected a lambda"
+
+and suspend_value ctx key expression =
+  match Hashtbl.find_opt ctx.ctx_abstract_calls key with
+  | Some (result, valid) -> add_z3constraint valid ctx, result
+  | None ->
+    let ctx, sort = translate_typ ctx (Mark.remove (Shared_ast.Expr.ty expression)) in
+    let result = Expr.mk_fresh_const ctx.ctx_z3 "abstract_result" sort in
+    let valid = Expr.mk_fresh_const ctx.ctx_z3 "abstract_valid"
+        (Boolean.mk_sort ctx.ctx_z3) in
+    Hashtbl.add ctx.ctx_abstract_calls key (result, valid);
+    Hashtbl.replace ctx.ctx_z3bounds (Z3.AST.get_id (Expr.ast_of_expr result))
+      (expression_list_bound ctx expression);
+    List.iter (fun e -> Hashtbl.replace ctx.ctx_abstract_symbols
+      (Z3.AST.get_id (Expr.ast_of_expr e)) ()) [result; valid];
+    Queue.add (valid, [result; valid], fun live ->
+      let work = { live with
+        ctx_z3definitions = ctx.ctx_z3definitions;
+        ctx_z3types = ctx.ctx_z3types;
+        ctx_z3matchsubsts = ctx.ctx_z3matchsubsts;
+        ctx_z3valuecache = Var.Map.empty;
+        ctx_z3resolving = Var.Set.empty;
+        ctx_z3constraints = [] } in
+      let work, exact = translate_expr work expression in
+      let equations = [
+        Boolean.mk_eq work.ctx_z3 valid
+          (Boolean.mk_and work.ctx_z3 work.ctx_z3constraints);
+        Boolean.mk_implies work.ctx_z3 valid
+          (Boolean.mk_eq work.ctx_z3 result exact)] in
+      { work with
+        ctx_z3definitions = live.ctx_z3definitions;
+        ctx_z3types = live.ctx_z3types;
+        ctx_z3matchsubsts = live.ctx_z3matchsubsts;
+        ctx_z3valuecache = live.ctx_z3valuecache;
+        ctx_z3resolving = live.ctx_z3resolving;
+        ctx_z3constraints = live.ctx_z3constraints }, equations)
+      ctx.ctx_pending_relations;
+    add_z3constraint valid ctx, result
 
 (** [create_z3unit] creates a Z3 sort and expression corresponding to the unit
     type and value respectively. Concretely, we represent unit as a tuple with 0
@@ -2409,11 +2969,14 @@ module Backend = struct
     {
       ctx_z3 = z3_ctx;
       ctx_decl = decl_ctx;
+      ctx_function_types = function_type_closure decl_ctx;
       ctx_funcdecl = Var.Map.empty;
       ctx_z3vars = StringMap.empty;
       ctx_z3datatypes = EnumName.Map.empty;
       ctx_z3matchsubsts = Var.Map.empty;
       ctx_z3structs = StructName.Map.empty;
+      ctx_z3types = [];
+      ctx_head_values = Hashtbl.create 257;
       ctx_z3unit = z3unit;
       ctx_z3duration = z3duration;
       ctx_z3defaults = StringMap.empty;
@@ -2425,6 +2988,17 @@ module Backend = struct
       ctx_allow_fatal_dummy = false;
       ctx_z3definitions = Var.Map.empty;
       ctx_z3valuecache = Var.Map.empty;
+      ctx_capacity_limited = ref false;
+      ctx_z3bounds = Hashtbl.create 257;
+      ctx_calendar_pending = ref [];
+      ctx_environment_ids = Hashtbl.create 257;
+      ctx_expression_ids = ExpressionIdentity.create 257;
+      ctx_pending_relations = Queue.create ();
+      ctx_abstract_symbols = Hashtbl.create 257;
+      ctx_relation_graph = Hashtbl.create 257;
+      ctx_abstract_calls = Hashtbl.create 257;
+      ctx_lazy_relations = false;
+      ctx_summary_cache = Hashtbl.create 257;
       ctx_z3resolving = Var.Set.empty;
       ctx_z3freevars = Var.Set.empty;
       ctx_z3constraints = [];
@@ -2439,11 +3013,18 @@ type direct_session = {
   direct_input_expr : Expr.expr;
   direct_solver : Z3.Solver.solver;
   mutable direct_objectives : Expr.expr StringMap.t;
-  mutable direct_last_input : Expr.expr option;
+  mutable direct_last_model : Model.model option;
+  mutable direct_query_roots : Expr.expr list;
+  mutable direct_failure_roots : Expr.expr list;
   mutable direct_unknowns : string StringMap.t;
-  direct_compiled_definition_guards : (string, unit) Hashtbl.t;
+  direct_compiled_definition_guards : (string, Expr.expr * Expr.expr list ref) Hashtbl.t;
+  mutable direct_failures : (Runtime.code_location * bool ref * (unit -> unit)) list;
+  direct_asserted_constraints : (int * int, unit) Hashtbl.t;
+  mutable direct_complete : bool;
+  mutable direct_errors : string list;
   direct_deferred_definitions : (unit -> unit) Queue.t;
   mutable direct_on_objective : string -> unit;
+  mutable direct_lazy_target : string option;
 }
 
 let rec bounded_value_constraints ctx max_list_length ty value =
@@ -2479,8 +3060,9 @@ let rec bounded_value_constraints ctx max_list_length ty value =
           in
           Boolean.mk_implies ctx.ctx_z3 (Boolean.mk_not ctx.ctx_z3 present)
             (Boolean.mk_eq ctx.ctx_z3 element padding)
-          :: (bounded_value_constraints ctx max_list_length element_ty element
-             |> List.map (Boolean.mk_implies ctx.ctx_z3 present)))
+          :: (if index >= max_list_length then [] else
+              bounded_value_constraints ctx max_list_length element_ty element
+              |> List.map (Boolean.mk_implies ctx.ctx_z3 present)))
         elements
       |> List.concat
     in
@@ -2565,6 +3147,7 @@ let rec bounded_value_constraints ctx max_list_length ty value =
   | TClosureEnv | TError -> []
 
 let create_direct_session
+    ~lazy_relations
     (decl_ctx : decl_ctx)
     ~(input_var : typed expr Var.t)
     ~(input_ty : typ)
@@ -2579,6 +3162,7 @@ let create_direct_session
       ctx_max_list_length = array_capacity;
       ctx_symbolic_list_bound = max_list_length;
       ctx_allow_fatal_dummy = true;
+      ctx_lazy_relations = lazy_relations;
       ctx_z3freevars = Var.Set.singleton input_var }
   in
   let ctx, input_sort = translate_typ ctx (Mark.remove input_ty) in
@@ -2595,11 +3179,76 @@ let create_direct_session
     direct_input_expr = input_expr;
     direct_solver = solver;
     direct_objectives = StringMap.empty;
-    direct_last_input = None;
+    direct_last_model = None;
+    direct_query_roots = [];
+    direct_failure_roots = [];
     direct_unknowns = StringMap.empty;
     direct_compiled_definition_guards = Hashtbl.create 257;
+    direct_failures = [];
+    direct_asserted_constraints = Hashtbl.create 257;
+    direct_complete = true;
+    direct_errors = [];
     direct_deferred_definitions = Queue.create ();
+    direct_lazy_target = None;
     direct_on_objective = (fun _ -> ()) }
+
+let mark_capacity_limited session = session.direct_ctx.ctx_capacity_limited := true
+
+let abstract_dependencies ctx expression =
+  let seen = Hashtbl.create 31 in
+  let pending = Stack.create () in
+  let result = ref [] in
+  Stack.push expression pending;
+  while not (Stack.is_empty pending) do
+    let value = Stack.pop pending in
+    let id = Z3.AST.get_id (Expr.ast_of_expr value) in
+    if not (Hashtbl.mem seen id) then begin
+      Hashtbl.add seen id ();
+      if Hashtbl.mem ctx.ctx_abstract_symbols id then result := id :: !result
+      else if Z3.AST.get_ast_kind (Expr.ast_of_expr value) = Z3enums.APP_AST then
+        List.iter (fun arg -> Stack.push arg pending) (Expr.get_args value)
+    end
+  done;
+  !result
+
+let refine_semantics session =
+  let ctx = session.direct_ctx in
+  let relevant = Hashtbl.create 127 in
+  let work = Queue.create () in
+  List.iter (fun root -> List.iter (fun id -> Queue.add id work)
+    (abstract_dependencies ctx root))
+    (session.direct_query_roots @ session.direct_failure_roots);
+  while not (Queue.is_empty work) do
+    let id = Queue.take work in
+    if not (Hashtbl.mem relevant id) then begin
+      Hashtbl.add relevant id ();
+      Option.iter (List.iter (List.iter (fun id -> Queue.add id work)))
+        (Hashtbl.find_opt ctx.ctx_relation_graph id)
+    end
+  done;
+  let pending = ctx.ctx_pending_relations in
+  let learned = ref 0 in
+  for _ = 1 to Queue.length pending do
+    let valid, outputs, expand = Queue.take pending in
+    let needed = List.exists (fun e -> Hashtbl.mem relevant
+        (Z3.AST.get_id (Expr.ast_of_expr e))) outputs in
+    let active = match session.direct_last_model with
+      | None -> true
+      | Some model -> Option.fold ~none:true ~some:Boolean.is_true
+          (Model.eval model valid true) in
+    if needed && active then begin
+      let ctx, equations = expand session.direct_ctx in
+      session.direct_ctx <- ctx;
+      List.iter (fun equation ->
+        let ids = abstract_dependencies ctx equation in
+        List.iter (fun id ->
+          let former = Option.value ~default:[] (Hashtbl.find_opt ctx.ctx_relation_graph id) in
+          Hashtbl.replace ctx.ctx_relation_graph id (ids :: former)) ids) equations;
+      Z3.Solver.add session.direct_solver equations;
+      incr learned
+    end else Queue.add (valid, outputs, expand) pending
+  done;
+  !learned
 
 let set_solver_timeout session timeout_ms =
   let timeout_ms = max 1 timeout_ms in
@@ -2624,6 +3273,8 @@ let register_reach session objective reach =
   session.direct_on_objective objective
 
 let mark_unknown session objective reason =
+  session.direct_complete <- false;
+  session.direct_errors <- reason :: session.direct_errors;
   if not (StringMap.mem objective session.direct_objectives) then
     session.direct_unknowns <-
       StringMap.add objective reason session.direct_unknowns
@@ -2654,6 +3305,8 @@ let rec objectives_in_expr objective_of_tag (e : typed expr) =
   here @ List.concat_map (objectives_in_expr objective_of_tag) children
 
 let mark_expr_unknown session objective_of_tag e reason =
+  session.direct_complete <- false;
+  session.direct_errors <- reason :: session.direct_errors;
   objectives_in_expr objective_of_tag e
   |> List.iter (fun objective -> mark_unknown session objective reason)
 
@@ -2675,16 +3328,45 @@ let resolve_callable definitions (e : typed expr) =
       |> resolve seen
     | _ -> e
     end
-  | EStructAccess { e = base; field; _ } ->
-    begin match Mark.remove (resolve seen base) with
+  | EStructAccess { e = base; field; name } ->
+    let base = resolve seen base in
+    begin match Mark.remove base with
     | EStruct { fields; _ } ->
       StructField.Map.find_opt field fields
       |> Option.fold ~none:e ~some:(resolve seen)
+    | _ when computed_context base -> project_computed base field name (Shared_ast.Expr.ty e)
     | _ -> e
     end
   | _ -> e
   in
   resolve Var.Set.empty e
+
+let resolve_callable_environment definitions expression =
+  let environment = ref definitions in
+  let rec resolve seen e = match Mark.remove e with
+    | EVar var when not (Var.Set.mem var seen) ->
+      Option.fold ~none:e ~some:(resolve (Var.Set.add var seen))
+        (Var.Map.find_opt var !environment)
+    | EAppOp { op = (Tag _, _); args = [inner]; _ } -> resolve seen inner
+    | EApp { f; args; _ } ->
+      begin match Mark.remove (resolve seen f) with
+      | EAbs { binder; _ } when Bindlib.mbinder_arity binder = List.length args ->
+        let vars, body = Bindlib.unmbind binder in
+        environment := List.fold_left2 (fun env var arg -> Var.Map.add var arg env)
+          !environment (Array.to_list vars) args;
+        resolve seen body
+      | _ -> e
+      end
+    | EStructAccess { e = base; field; name } ->
+      let base = resolve seen base in
+      begin match Mark.remove base with
+      | EStruct { fields; _ } -> resolve seen (StructField.Map.find field fields)
+      | _ when computed_context base -> project_computed base field name (Shared_ast.Expr.ty e)
+      | _ -> e
+      end
+    | _ -> e in
+  let result = resolve Var.Set.empty expression in
+  !environment, result
 
 let reachable_objectives ~objective_of_tag ~definitions body =
   let definitions =
@@ -2789,14 +3471,51 @@ let encode_under_guard session guard e =
   let rec add_new = function
     | constraints when constraints == previous_constraints -> ()
     | constraint_ :: rest ->
-      Z3.Solver.add session.direct_solver
-        [guarded_constraint ctx guard constraint_];
+      let key = Z3.AST.get_id (Expr.ast_of_expr guard),
+                Z3.AST.get_id (Expr.ast_of_expr constraint_) in
+      if not (Hashtbl.mem session.direct_asserted_constraints key) then begin
+        Hashtbl.add session.direct_asserted_constraints key ();
+        Z3.Solver.add session.direct_solver
+          [guarded_constraint ctx guard constraint_]
+      end;
       add_new rest
     | [] ->
       failwith "[Z3 encoding] constraint accumulator lost its previous tail"
   in
   add_new ctx.ctx_z3constraints;
   value
+
+(* Failure obligations retain their exact symbolic call environment. They are
+   activated by a concrete runtime location, never inferred from input values. *)
+let defer_failure session e action =
+  let types = session.direct_ctx.ctx_z3types in
+  let substs = session.direct_ctx.ctx_z3matchsubsts in
+  let definitions = session.direct_ctx.ctx_z3definitions in
+  let run () =
+    let former_types = session.direct_ctx.ctx_z3types in
+      let former_substs = session.direct_ctx.ctx_z3matchsubsts in
+    let former_definitions = session.direct_ctx.ctx_z3definitions in
+    session.direct_ctx <- { session.direct_ctx with
+      ctx_z3types = types; ctx_z3matchsubsts = substs; ctx_z3definitions = definitions };
+    Fun.protect ~finally:(fun () ->
+      session.direct_ctx <- { session.direct_ctx with
+        ctx_z3types = former_types;
+            ctx_z3matchsubsts = former_substs; ctx_z3definitions = former_definitions }) action
+  in
+  session.direct_failures <-
+    (Shared_ast.Expr.pos_to_runtime (typed_expr_pos e), ref false, run)
+    :: session.direct_failures
+
+let refine_failure session locations =
+  let learned = ref 0 in
+  List.iter (fun (location, active, run) ->
+    if not !active && List.exists (fun (failed : Runtime.code_location) ->
+      String.equal location.Runtime.filename failed.filename
+      && location.start_line <= failed.end_line
+      && failed.start_line <= location.end_line) locations then begin
+      run (); active := true; incr learned
+    end) session.direct_failures;
+  !learned
 
 let rec resolve_definition definitions (e : typed expr) =
   match Mark.remove e with
@@ -2808,26 +3527,103 @@ let rec resolve_definition definitions (e : typed expr) =
   | _ -> e
 
 let rec compile_reach_expr
-    ~should_visit session objective_of_tag definitions guard (e : typed expr) =
-  if not (should_visit e) then () else
+    ~reach_cache ~should_visit session objective_of_tag definitions guard (e : typed expr) =
+  let guard = Expr.simplify guard None in
+  if Boolean.is_false guard || not (should_visit definitions e) then () else
   let ctx () = session.direct_ctx.ctx_z3 in
   let compile =
-    compile_reach_expr ~should_visit session objective_of_tag definitions
+    compile_reach_expr ~reach_cache ~should_visit session objective_of_tag definitions
+  in
+  let suspend_reach key target guard run =
+    let use (active, reach) =
+      Z3.Solver.add session.direct_solver [Boolean.mk_implies (ctx ()) guard active];
+      register_reach session target (Boolean.mk_and (ctx ()) [guard; reach]) in
+    match Hashtbl.find_opt reach_cache key with
+    | Some summary -> use summary
+    | None ->
+    let reach = Expr.mk_fresh_const (ctx ()) "abstract_reach" (Boolean.mk_sort (ctx ())) in
+    let active = Expr.mk_fresh_const (ctx ()) "active_call" (Boolean.mk_sort (ctx ())) in
+    Hashtbl.add reach_cache key (active, reach);
+    use (active, reach);
+    let captured = session.direct_ctx in
+    Hashtbl.replace captured.ctx_abstract_symbols (Z3.AST.get_id (Expr.ast_of_expr reach)) ();
+    Queue.add (Boolean.mk_and (ctx ()) [active; reach], [reach], fun live ->
+      let saved_objectives = session.direct_objectives in
+      let saved_target = session.direct_lazy_target in
+      session.direct_lazy_target <- Some target;
+      session.direct_objectives <- StringMap.empty;
+      session.direct_ctx <- { live with
+        ctx_z3definitions = captured.ctx_z3definitions;
+        ctx_z3types = captured.ctx_z3types;
+        ctx_z3matchsubsts = captured.ctx_z3matchsubsts;
+        ctx_z3valuecache = captured.ctx_z3valuecache };
+      Fun.protect ~finally:(fun () ->
+        session.direct_lazy_target <- saved_target;
+        session.direct_objectives <- saved_objectives)
+        (fun () ->
+          run active;
+          while not (Queue.is_empty session.direct_deferred_definitions) do
+            Queue.take session.direct_deferred_definitions ()
+          done;
+          let exact = Option.value ~default:(Boolean.mk_false (ctx ()))
+            (StringMap.find_opt target session.direct_objectives) in
+          let next = { session.direct_ctx with
+            ctx_z3definitions = live.ctx_z3definitions;
+            ctx_z3types = live.ctx_z3types;
+            ctx_z3matchsubsts = live.ctx_z3matchsubsts;
+            ctx_z3valuecache = live.ctx_z3valuecache } in
+          next, [Boolean.mk_eq (ctx ()) reach exact]))
+      captured.ctx_pending_relations
+  in
+  let share_call key guard run =
+    match session.direct_lazy_target with
+    | Some target -> suspend_reach key target guard run
+    | None -> match Hashtbl.find_opt session.direct_compiled_definition_guards key with
+    | Some (_, callers) -> callers := guard :: !callers
+    | None ->
+      let active = Boolean.mk_const_s (ctx ())
+        ("active_definition_" ^ string_of_int
+          (Hashtbl.length session.direct_compiled_definition_guards)) in
+      Hashtbl.add session.direct_compiled_definition_guards key (active, ref [guard]);
+      let captured_types = session.direct_ctx.ctx_z3types in
+      let captured_substs = session.direct_ctx.ctx_z3matchsubsts in
+      let captured_definitions = session.direct_ctx.ctx_z3definitions in
+      Queue.add (fun () ->
+        let former_types = session.direct_ctx.ctx_z3types in
+      let former_substs = session.direct_ctx.ctx_z3matchsubsts in
+        let former_definitions = session.direct_ctx.ctx_z3definitions in
+        session.direct_ctx <- { session.direct_ctx with
+          ctx_z3types = captured_types;
+            ctx_z3matchsubsts = captured_substs;
+          ctx_z3definitions = captured_definitions };
+        Fun.protect ~finally:(fun () ->
+          session.direct_ctx <- { session.direct_ctx with
+            ctx_z3types = former_types;
+            ctx_z3matchsubsts = former_substs;
+            ctx_z3definitions = former_definitions })
+          (fun () -> run active)) session.direct_deferred_definitions
   in
   let compile_function guard fn arguments =
-    let fn = resolve_callable definitions fn in
+    let former_definitions = session.direct_ctx.ctx_z3definitions in
+    let next_ctx, fn = resolve_value_head
+        { session.direct_ctx with ctx_z3definitions = definitions } fn in
+    let definitions = next_ctx.ctx_z3definitions in
+    session.direct_ctx <- next_ctx;
     match Mark.remove fn with
-    | EAbs { binder; _ }
+    | EAbs { binder; tys; _ }
       when Bindlib.mbinder_arity binder = List.length arguments ->
       let vars, body = Bindlib.unmbind binder in
+      let former_types = session.direct_ctx.ctx_z3types in
       let former_substs = session.direct_ctx.ctx_z3matchsubsts in
+      session.direct_ctx <- List.fold_left2 (fun ctx ty value ->
+        bind_type_sort ctx ty (Expr.get_sort value)) session.direct_ctx tys arguments;
       session.direct_ctx <-
         List.fold_left2
           (fun ctx var argument -> add_z3matchsubst var argument ctx)
           session.direct_ctx (Array.to_list vars) arguments;
-      compile guard body;
+      compile_reach_expr ~reach_cache ~should_visit session objective_of_tag definitions guard body;
       session.direct_ctx <-
-        { session.direct_ctx with ctx_z3matchsubsts = former_substs }
+        { session.direct_ctx with ctx_z3definitions = former_definitions; ctx_z3types = former_types; ctx_z3matchsubsts = former_substs }
     | _ ->
       mark_expr_unknown session objective_of_tag fn
         "a bounded-list operator did not receive a lambda"
@@ -2857,7 +3653,7 @@ let rec compile_reach_expr
     compile guard inner
   | EIfThenElse { cond; etrue; efalse } ->
     compile guard cond;
-    begin
+    if should_visit definitions etrue || should_visit definitions efalse then begin
       try
         let predicate = encode_under_guard session guard cond in
         let yes = Boolean.mk_and (ctx ()) [guard; predicate] in
@@ -2886,7 +3682,8 @@ let rec compile_reach_expr
         let members = enum_z3_members session.direct_ctx enum z3_enum in
         EnumConstructor.Map.iter
           (fun constructor arm ->
-            let former_substs = session.direct_ctx.ctx_z3matchsubsts in
+            let former_types = session.direct_ctx.ctx_z3types in
+      let former_substs = session.direct_ctx.ctx_z3matchsubsts in
             let _, _, recognizer, accessors =
               List.find
                 (fun (candidate, _, _, _) ->
@@ -2894,7 +3691,7 @@ let rec compile_reach_expr
                 members
             in
             match Mark.remove arm with
-            | EAbs { binder; _ } ->
+            | EAbs { binder; tys; _ } ->
               let vars, body = Bindlib.unmbind binder in
               let arm_guard =
                 Boolean.mk_and (ctx ())
@@ -2914,7 +3711,7 @@ let rec compile_reach_expr
               session.direct_ctx <- arm_ctx;
               compile arm_guard body;
               session.direct_ctx <-
-                { session.direct_ctx with ctx_z3matchsubsts = former_substs }
+                { session.direct_ctx with ctx_z3types = former_types; ctx_z3matchsubsts = former_substs }
             | _ -> mark_expr_unknown session objective_of_tag arm
                      "a DCalc match arm is not a lambda")
           cases
@@ -2960,17 +3757,19 @@ let rec compile_reach_expr
         mark_expr_unknown session objective_of_tag just reason;
         mark_expr_unknown session objective_of_tag cons reason
     end
-  | EApp { f = (EAbs { binder; _ }, _); args; _ } ->
+  | EApp { f = (EAbs { binder; tys; _ }, _); args; _ } ->
     List.iter (compile guard) args;
     if Bindlib.mbinder_arity binder = List.length args then begin
       let vars, body = Bindlib.unmbind binder in
+      let former_types = session.direct_ctx.ctx_z3types in
       let former_substs = session.direct_ctx.ctx_z3matchsubsts in
       let former_definitions = session.direct_ctx.ctx_z3definitions in
       let definitions = ref definitions in
       begin
         try
-          Array.iter2
-            (fun var arg ->
+          Array.iteri
+            (fun index var ->
+              let arg = List.nth args index in
               definitions := Var.Map.add var arg !definitions;
               session.direct_ctx <-
                 { session.direct_ctx with
@@ -2983,10 +3782,11 @@ let rec compile_reach_expr
                 ()
               | _ ->
                 let value = encode_under_guard session guard arg in
+                session.direct_ctx <- bind_type_sort session.direct_ctx (List.nth tys index) (Expr.get_sort value);
                 session.direct_ctx <-
                   add_z3matchsubst var value session.direct_ctx)
-            vars (Array.of_list args);
-          compile_reach_expr ~should_visit session objective_of_tag
+            vars;
+          compile_reach_expr ~reach_cache ~should_visit session objective_of_tag
             !definitions guard body
         with
         | Failure reason | Invalid_argument reason | Z3.Error reason ->
@@ -2994,39 +3794,67 @@ let rec compile_reach_expr
       end;
       session.direct_ctx <-
         { session.direct_ctx with
-          ctx_z3matchsubsts = former_substs;
+          ctx_z3types = former_types;
+            ctx_z3matchsubsts = former_substs;
           ctx_z3definitions = former_definitions }
     end else
       mark_expr_unknown session objective_of_tag e
         "function arity mismatch during reachability compilation"
   | EApp { f; args; _ } ->
-    let resolved = resolve_callable definitions f in
+    compile guard f;
+    let next_ctx, resolved = resolve_value_head
+        { session.direct_ctx with ctx_z3definitions = definitions } f in
+    let definitions = next_ctx.ctx_z3definitions in
+    session.direct_ctx <- next_ctx;
     begin match Mark.remove resolved with
     | EAbs { binder; _ } ->
-      compile_reach_expr ~should_visit session objective_of_tag definitions guard
-        (EApp { f = resolved; args; tys = [] }, Mark.get e)
+      List.iter (compile guard) args;
+      let argument_key arg =
+        let (Typed { ty; _ }) = Mark.get arg in
+        if type_contains_function session.direct_ctx ty then
+          "closure:" ^ string_of_int (expression_identity session.direct_ctx arg)
+          ^ ":" ^ symbolic_environment_key session.direct_ctx arg
+        else
+          let value = encode_under_guard session guard arg in
+          "value:" ^ string_of_int (Z3.AST.get_id (Expr.ast_of_expr value))
+      in
+      let key = "call:" ^ string_of_int (expression_identity session.direct_ctx resolved)
+        ^ ":" ^ symbolic_environment_key session.direct_ctx resolved
+        ^ ":" ^ String.concat ";" (List.map argument_key args) in
+      share_call key guard (fun active ->
+        compile_reach_expr ~reach_cache ~should_visit session objective_of_tag definitions active
+          (EApp { f = resolved; args; tys = [] }, Mark.get e))
+    | _ when computed_context resolved ->
+      compile_reach_expr ~reach_cache ~should_visit session objective_of_tag definitions guard
+        (apply_computed resolved args (Shared_ast.Expr.ty e))
     | _ ->
       compile guard resolved;
       List.iter (compile guard) args
     end
-  | EAppOp { op = ((Map | Filter | Find), _); args = [fn; list]; _ } ->
+  | EAppOp { op = (((Map | Filter | Find) as operator), _); args = [fn; list]; _ } ->
     compile guard list;
     begin
       try
         let array = encode_under_guard session guard list in
         let length, elements =
           bounded_array_components
-            ~limit:(expression_list_bound session.direct_ctx list)
+            ~limit:(encoded_list_bound session.direct_ctx list array)
             session.direct_ctx array
         in
+        let searching = ref (Boolean.mk_true (ctx ())) in
         List.iteri
           (fun index element ->
-            let present =
-              Arithmetic.mk_gt (ctx ()) length
-                (Arithmetic.Integer.mk_numeral_i (ctx ()) index)
-            in
-            compile_function
-              (Boolean.mk_and (ctx ()) [guard; present]) fn [element])
+            let present = Arithmetic.mk_gt (ctx ()) length
+                (Arithmetic.Integer.mk_numeral_i (ctx ()) index) in
+            let active = Boolean.mk_and (ctx ()) [guard; present; !searching] in
+            compile_function active fn [element];
+            if operator = Find then begin
+              let previous = session.direct_ctx.ctx_z3constraints in
+              let next_ctx, predicate = translate_function_value session.direct_ctx fn [element] in
+              session.direct_ctx <- guard_new_constraints next_ctx previous active;
+              searching := Boolean.mk_and (ctx ())
+                [!searching; Boolean.mk_not (ctx ()) predicate]
+            end)
           elements
       with
       | Failure reason | Invalid_argument reason | Z3.Error reason ->
@@ -3039,7 +3867,7 @@ let rec compile_reach_expr
         let array = encode_under_guard session guard list in
         let length, elements =
           bounded_array_components
-            ~limit:(expression_list_bound session.direct_ctx list)
+            ~limit:(encoded_list_bound session.direct_ctx list array)
             session.direct_ctx array
         in
         begin match elements with
@@ -3079,7 +3907,7 @@ let rec compile_reach_expr
         let array = encode_under_guard session guard list in
         let length, elements =
           bounded_array_components
-            ~limit:(expression_list_bound session.direct_ctx list)
+            ~limit:(encoded_list_bound session.direct_ctx list array)
             session.direct_ctx array
         in
         List.iteri
@@ -3111,55 +3939,78 @@ let rec compile_reach_expr
   | EStruct { fields; _ } ->
     StructField.Map.iter (fun _ field -> compile guard field) fields
   | EAssert assertion ->
-    compile guard assertion;
-    begin
-      try
-        let predicate = encode_under_guard session guard assertion in
-        Z3.Solver.add session.direct_solver
-          [Boolean.mk_implies (ctx ()) guard predicate]
-      with
-      | Failure reason | Invalid_argument reason | Z3.Error reason ->
-        mark_expr_unknown session objective_of_tag assertion reason
-    end
+    (* Assertion predicates remain lazy, but their own source branches are
+       ordinary coverage objectives and must retain executable instances. *)
+    if reachable_objectives ~objective_of_tag
+         ~definitions:(Var.Map.bindings definitions) assertion <> [] then
+      compile guard assertion;
+    defer_failure session e (fun () ->
+      let predicate = encode_under_guard session guard assertion in
+      let obligation = Boolean.mk_implies (ctx ()) guard predicate in
+      session.direct_failure_roots <- obligation :: session.direct_failure_roots;
+      Z3.Solver.add session.direct_solver [obligation])
   | EErrorOnEmpty inner ->
-    (* DCalc lowers error-on-empty into ordinary guarded defaults and matches.
-       Their [EFatalError] leaf below contributes [not guard], which is the
-       precise normal-termination condition without forcing the value encoder
-       to manufacture a value for an exception. *)
-    compile guard inner
+    compile guard inner;
+    (* Normal execution requires a defined, nonconflicting default. Keep this
+       obligation deferred, including when its value is outside the target's
+       dependency slice. *)
+    defer_failure session e (fun () ->
+      let previous = session.direct_ctx.ctx_z3constraints in
+      ignore (encode_under_guard session guard e);
+      let rec retain = function
+        | constraints when constraints == previous -> ()
+        | constraint_ :: rest ->
+          session.direct_failure_roots <-
+            guarded_constraint session.direct_ctx guard constraint_
+            :: session.direct_failure_roots;
+          retain rest
+        | [] -> failwith "[Z3 encoding] lost failure constraint tail"
+      in
+      retain session.direct_ctx.ctx_z3constraints)
   | EStructAccess { e; _ } | ETupleAccess { e; _ } | EInj { e; _ }
   | EPureDefault e -> compile guard e
   | EFatalError _ ->
-    Z3.Solver.add session.direct_solver [Boolean.mk_not (ctx ()) guard]
+    defer_failure session e (fun () ->
+      let obligation = Boolean.mk_not (ctx ()) guard in
+      session.direct_failure_roots <- obligation :: session.direct_failure_roots;
+      Z3.Solver.add session.direct_solver [obligation])
   | EVar var ->
     begin match Var.Map.find_opt var definitions with
     | None -> ()
+    | Some (EAbs _, _) -> ()
+    | Some definition when session.direct_lazy_target <> None
+        && not (needs_value_summary definition) -> compile guard definition
+    | Some definition when session.direct_lazy_target <> None ->
+      let key = "value:" ^ string_of_int (Bindlib.uid_of var) ^ ":"
+        ^ symbolic_environment_key session.direct_ctx definition in
+      suspend_reach key (Option.get session.direct_lazy_target) guard
+        (fun guard -> compile guard definition)
     | Some definition ->
-      (* Definitions are the sharing nodes of DCalc's acyclic graph. Compile a
-         definition once per symbolic guard, rather than either treating it as
-         opaque (which loses its failures/branches) or blindly expanding every
-         reference (which recreates the old whole-expression explosion). *)
-      let guard_id = Digest.(to_hex (string (Expr.to_string guard))) in
-      let key = string_of_int (Bindlib.uid_of var) ^ ":" ^ guard_id in
-      if not (Hashtbl.mem session.direct_compiled_definition_guards key) then
-      begin
-        Hashtbl.replace session.direct_compiled_definition_guards key ();
-        let captured_substs = session.direct_ctx.ctx_z3matchsubsts in
-        let captured_z3definitions = session.direct_ctx.ctx_z3definitions in
-        Queue.add
-          (fun () ->
-            let caller_substs = session.direct_ctx.ctx_z3matchsubsts in
-            let caller_definitions = session.direct_ctx.ctx_z3definitions in
-            session.direct_ctx <-
-              { session.direct_ctx with
-                ctx_z3matchsubsts = captured_substs;
-                ctx_z3definitions = captured_z3definitions };
-            compile guard definition;
-            session.direct_ctx <-
-              { session.direct_ctx with
-                ctx_z3matchsubsts = caller_substs;
-                ctx_z3definitions = caller_definitions })
-          session.direct_deferred_definitions
+      let key = string_of_int (Bindlib.uid_of var) ^ ":"
+        ^ symbolic_environment_key session.direct_ctx definition in
+      begin match Hashtbl.find_opt session.direct_compiled_definition_guards key with
+      | Some (_, callers) -> callers := guard :: !callers
+      | None ->
+        let active = Boolean.mk_const_s (ctx ())
+          ("active_definition_" ^ string_of_int (Hashtbl.length session.direct_compiled_definition_guards)) in
+        let callers = ref [guard] in
+        Hashtbl.add session.direct_compiled_definition_guards key (active, callers);
+        let captured_types = session.direct_ctx.ctx_z3types in
+      let captured_substs = session.direct_ctx.ctx_z3matchsubsts in
+        let captured_definitions = session.direct_ctx.ctx_z3definitions in
+        Queue.add (fun () ->
+          let former_types = session.direct_ctx.ctx_z3types in
+      let former_substs = session.direct_ctx.ctx_z3matchsubsts in
+          let former_definitions = session.direct_ctx.ctx_z3definitions in
+          session.direct_ctx <- { session.direct_ctx with
+            ctx_z3types = captured_types;
+            ctx_z3matchsubsts = captured_substs;
+            ctx_z3definitions = captured_definitions };
+          compile active definition;
+          session.direct_ctx <- { session.direct_ctx with
+            ctx_z3types = former_types;
+            ctx_z3matchsubsts = former_substs;
+            ctx_z3definitions = former_definitions }) session.direct_deferred_definitions
       end
     end
   | EExternal _ | ELit _ | EEmpty | EPos _ | EBad ->
@@ -3169,6 +4020,7 @@ let rec compile_reach_expr
 let compile_reachability
     ?(on_objective = fun _ -> ())
     session ~objective_of_tag ~definitions body =
+  let reach_cache = Hashtbl.create 257 in
   let entry = Boolean.mk_true session.direct_ctx.ctx_z3 in
   let definitions =
     List.fold_left
@@ -3181,171 +4033,112 @@ let compile_reachability
   Fun.protect
     ~finally:(fun () -> session.direct_on_objective <- (fun _ -> ()))
     (fun () ->
-      compile_reach_expr ~should_visit:(fun _ -> true) session objective_of_tag
+      compile_reach_expr ~reach_cache ~should_visit:(fun _ _ -> true) session objective_of_tag
         definitions entry body;
       (* Definition nodes are expanded breadth-first. Shallow objectives can
          therefore be solved and replayed before one deep historical/default
          chain monopolizes guarded formula construction. *)
       while not (Queue.is_empty session.direct_deferred_definitions) do
         Queue.take session.direct_deferred_definitions ()
-      done)
+      done;
+      Hashtbl.iter (fun _ (active, callers) ->
+        Z3.Solver.add session.direct_solver
+          [Boolean.mk_eq session.direct_ctx.ctx_z3 active
+             (Boolean.mk_or session.direct_ctx.ctx_z3 !callers)])
+        session.direct_compiled_definition_guards)
 
 let compile_objective
     ?(on_objective = fun _ -> ())
     ?(on_timing = fun _ _ -> ())
+    ?(failure_locations = [])
     session ~objective_of_tag ~definitions objective body =
-  let selection_started = Sys.time () in
-  Message.debug "BOBCat: selecting backward slice for %s" objective;
-  let definitions =
-    List.fold_left
-      (fun env (var, definition) -> Var.Map.add var definition env)
-      Var.Map.empty definitions
-  in
-  let target_file, target_line =
-    try
-      let at = String.index objective '@' + 1 in
-      let slash = String.index_from objective at '/' in
-      let decision = String.sub objective at (slash - at) in
-      let pieces = String.split_on_char ':' decision in
-      let count = List.length pieces in
-      let file =
-        pieces |> List.filteri (fun index _ -> index < count - 3)
-        |> String.concat ":"
-      in
-      file, int_of_string (List.nth pieces (count - 3))
-    with _ -> "", (-1)
-  in
-  let rec source_score seen (e : typed expr) =
-    let pos = typed_expr_pos e in
-    let direct =
-    if not (String.equal (Pos.get_file pos) target_file) then 0
-    else if Pos.get_start_line pos <= target_line
-            && target_line <= Pos.get_end_line pos
-    then 2
-    else 1
-    in
-    if direct > 0 then direct
-    else match Mark.remove e with
-    | EVar var when not (Var.Set.mem var seen) ->
-      Option.fold ~none:0
-        ~some:(source_score (Var.Set.add var seen))
-        (Var.Map.find_opt var definitions)
-    | _ -> 0
-  in
-  let memo = Hashtbl.create 257 in
-  let selected_nodes = ref [] in
-  let rec contains seen (e : typed expr) =
-    let own =
-      match Mark.remove e with
-      | EAppOp
-          { op = Tag ((Branching _ | Exception _) as tag), _; _ } ->
+  let reach_cache = Hashtbl.create 257 in
+  (* Re-slicing after a newly observed failure replaces the old abstraction.
+     Keeping it as an OR alternative would let the solver bypass refinement. *)
+  session.direct_objectives <- StringMap.remove objective session.direct_objectives;
+  session.direct_lazy_target <- Some objective;
+  let started = Sys.time () in
+  let globals = List.fold_left (fun env (var, value) ->
+    Var.Map.add var value env) Var.Map.empty definitions in
+  let global_memo = Hashtbl.create 257 in
+  let matches_failure e =
+    let pos = Shared_ast.Expr.pos_to_runtime (typed_expr_pos e) in
+    List.exists (fun (loc : Runtime.code_location) ->
+      String.equal pos.filename loc.filename
+      && pos.start_line <= loc.end_line && loc.start_line <= pos.end_line)
+      failure_locations in
+  (* A conservative effect census. All callers are retained, including callers
+     through unknown higher-order parameters. No source-location ranking or
+     candidate root selection is used: guards always start at the entry. *)
+  let rec contains env seen e =
+    let own = match Mark.remove e with
+      | EAppOp { op = Tag ((Branching _ | Exception _) as tag), _; _ } ->
         Option.fold ~none:false ~some:(String.equal objective)
           (objective_of_tag tag (typed_expr_pos e))
-      | _ -> false
-    in
-    let result = own ||
-    (match Mark.remove e with
+      | EAssert _ | EErrorOnEmpty _ | EFatalError _ -> matches_failure e
+      | _ -> false in
+    own || match Mark.remove e with
     | EVar var ->
-      if Var.Set.mem var seen then false
-      else begin match Var.Map.find_opt var definitions with
-      | None -> true
+      if Var.Set.mem var seen then true else
+      begin match Var.Map.find_opt var env with
+      | None -> type_contains_function session.direct_ctx (Shared_ast.Expr.ty e)
       | Some definition ->
-        let key = Bindlib.uid_of var in
-        begin match Hashtbl.find_opt memo key with
-        | Some result -> result
-        | None ->
-          let result = contains (Var.Set.add var seen) definition in
-          Hashtbl.replace memo key result;
-          result
-        end
+        let compute () = contains env (Var.Set.add var seen) definition in
+        if Var.Map.mem var globals then
+          let key = Bindlib.uid_of var in
+          begin match Hashtbl.find_opt global_memo key with
+          | Some answer -> answer
+          | None -> let answer = compute () in
+            Hashtbl.add global_memo key answer; answer
+          end
+        else compute ()
       end
-    | EMatch { e; cases; _ } ->
-      contains seen e
-      || any seen
-           (EnumConstructor.Map.values cases
-            |> List.map (fun arm ->
-              (fun () ->
-             Option.fold ~none:false ~some:(String.equal objective)
-               (objective_of_tag (Branching None) (typed_expr_pos arm))
-             || contains seen arm), arm))
     | EAbs { binder; _ } ->
-      let _, body = Bindlib.unmbind binder in contains seen body
-    | EApp { f; args; _ } ->
-      any seen (List.map (fun e -> (fun () -> contains seen e), e) (f :: args))
+      let _, body = Bindlib.unmbind binder in contains env seen body
+    | EApp { f; args; _ } -> List.exists (contains env seen) (f :: args)
+    | EMatch { e; cases; _ } ->
+      contains env seen e || EnumConstructor.Map.exists (fun _ arm ->
+        Option.fold ~none:false ~some:(String.equal objective)
+          (objective_of_tag (Branching None) (typed_expr_pos arm))
+        || contains env seen arm) cases
     | EAppOp { args; _ } | EArray args | ETuple args ->
-      any seen (List.map (fun e -> (fun () -> contains seen e), e) args)
+      List.exists (contains env seen) args
     | EIfThenElse { cond; etrue; efalse } ->
-      let children = [cond; etrue; efalse] in
-      any seen (List.map (fun e -> (fun () -> contains seen e), e) children)
+      List.exists (contains env seen) [cond; etrue; efalse]
     | EStruct { fields; _ } ->
-      StructField.Map.values fields
-      |> List.map (fun e -> (fun () -> contains seen e), e)
-      |> any seen
+      StructField.Map.exists (fun _ e -> contains env seen e) fields
     | EStructAccess { e; _ } | ETupleAccess { e; _ } | EInj { e; _ }
-    | EAssert e | EPureDefault e | EErrorOnEmpty e -> contains seen e
+    | EAssert e | EPureDefault e | EErrorOnEmpty e -> contains env seen e
     | EDefault { excepts; just; cons } ->
-      let children = just :: cons :: excepts in
-      any seen (List.map (fun e -> (fun () -> contains seen e), e) children)
-    | EExternal _ | ELit _ | EEmpty | EPos _ | EFatalError _ | EBad -> false
-    | _ -> false)
-    in
-    if result
-       && not (List.exists (fun selected -> selected == e) !selected_nodes)
-    then selected_nodes := e :: !selected_nodes;
-    result
-  and any _seen candidates =
-    candidates
-    |> List.sort (fun (_, left) (_, right) ->
-         Int.compare
-           (source_score Var.Set.empty right)
-           (source_score Var.Set.empty left))
-    |> List.exists (fun (test, _) -> test ())
-  in
-  let slice_root =
-    Var.Map.bindings definitions
-    |> List.filter_map (fun (_, definition) ->
-         let pos = typed_expr_pos definition in
-         if source_score Var.Set.empty definition = 2 then
-           Some
-             ( max 0 (Pos.get_end_line pos - Pos.get_start_line pos),
-               definition )
-         else None)
-    |> List.sort (fun (left, _) (right, _) -> Int.compare left right)
-    |> fun candidates -> List.nth_opt candidates 0
-    |> Option.fold ~none:body ~some:snd
-  in
-  Message.debug "BOBCat: selected candidate slice root %s for %s"
-    (Pos.to_string_short (typed_expr_pos slice_root)) objective;
-  ignore (contains Var.Set.empty slice_root);
-  on_timing "slice_selection" (Sys.time () -. selection_started);
-  Message.debug "BOBCat: indexed backward slice for %s" objective;
-  let should_visit e =
-    List.exists (fun selected -> selected == e) !selected_nodes
-    || contains Var.Set.empty e
-  in
+      List.exists (contains env seen) (just :: cons :: excepts)
+    | _ -> false in
   let objective_of_tag tag pos =
     match objective_of_tag tag pos with
     | Some candidate when String.equal candidate objective -> Some candidate
-    | _ -> None
-  in
-  let entry = Boolean.mk_true session.direct_ctx.ctx_z3 in
-  session.direct_ctx <-
-    { session.direct_ctx with ctx_z3definitions = definitions };
-  Queue.clear session.direct_deferred_definitions;
-  Hashtbl.clear session.direct_compiled_definition_guards;
+    | _ -> None in
+  let should_visit env e = contains env Var.Set.empty e in
+  session.direct_ctx <- { session.direct_ctx with ctx_z3definitions = globals };
+  on_timing "slice_selection" (Sys.time () -. started);
+  let started = Sys.time () in
   session.direct_on_objective <- on_objective;
-  let compilation_started = Sys.time () in
-  Fun.protect
-    ~finally:(fun () ->
-      on_timing "slice_compilation" (Sys.time () -. compilation_started);
-      session.direct_on_objective <- (fun _ -> ()))
-    (fun () ->
-      compile_reach_expr ~should_visit session objective_of_tag definitions
-        entry slice_root;
-      while not (Queue.is_empty session.direct_deferred_definitions) do
-        Queue.take session.direct_deferred_definitions ()
-      done;
-      Message.debug "BOBCat: compiled backward slice for %s" objective)
+  Fun.protect ~finally:(fun () ->
+    session.direct_on_objective <- (fun _ -> ());
+    on_timing "slice_compilation" (Sys.time () -. started)) (fun () ->
+    compile_reach_expr ~reach_cache ~should_visit session objective_of_tag globals
+      (Boolean.mk_true session.direct_ctx.ctx_z3) body;
+    while not (Queue.is_empty session.direct_deferred_definitions) do
+      Queue.take session.direct_deferred_definitions ()
+    done;
+    Hashtbl.iter (fun _ (active, callers) ->
+      Z3.Solver.add session.direct_solver
+        [Boolean.mk_eq session.direct_ctx.ctx_z3 active
+          (Boolean.mk_or session.direct_ctx.ctx_z3 !callers)])
+      session.direct_compiled_definition_guards;
+    let learned = refine_failure session failure_locations in
+    if learned > 0 then Message.result "BOBCAT_REFINEMENT %s"
+      (Yojson.Safe.to_string (`Assoc [
+        "reason", `String "expanded failure dependency slice";
+        "learned_obligations", `Int learned])))
 
 let unknown_objectives session = StringMap.bindings session.direct_unknowns
 
@@ -3371,12 +4164,12 @@ let solve_uncovered
           (StringMap.find_opt objective session.direct_objectives))
       objectives
   in
+  session.direct_query_roots <- List.map snd selected;
   match selected with
   | [] -> Coverage_unsat
   | _ ->
     let decode model predicted_pool =
-      let input_value = eval_model model session.direct_input_expr in
-      session.direct_last_input <- Some input_value;
+      session.direct_last_model <- Some model;
       let predicted =
         List.filter_map
           (fun (objective, reach) ->
@@ -3457,114 +4250,18 @@ let solve_uncovered
     answer
     end
 
-let rec semantic_value_equality ctx ty left right =
-  let eq = Boolean.mk_eq ctx.ctx_z3 in
-  match Mark.remove ty with
-  | TArray element_ty ->
-    let accessors = List.hd (Datatype.get_accessors (Expr.get_sort left)) in
-    begin match accessors with
-    | length_accessor :: element_accessors ->
-      let left_length = Expr.mk_app ctx.ctx_z3 length_accessor [left] in
-      let right_length = Expr.mk_app ctx.ctx_z3 length_accessor [right] in
-      let elements_equal =
-        List.mapi
-          (fun index accessor ->
-            let present =
-              Arithmetic.mk_gt ctx.ctx_z3 left_length
-                (Arithmetic.Integer.mk_numeral_i ctx.ctx_z3 index)
-            in
-            let left_element = Expr.mk_app ctx.ctx_z3 accessor [left] in
-            let right_element = Expr.mk_app ctx.ctx_z3 accessor [right] in
-            Boolean.mk_implies ctx.ctx_z3 present
-              (semantic_value_equality ctx element_ty left_element right_element))
-          element_accessors
-      in
-      Boolean.mk_and ctx.ctx_z3 (eq left_length right_length :: elements_equal)
-    | [] -> eq left right
-    end
-  | TStruct name ->
-    let fields = StructName.Map.find name ctx.ctx_decl.ctx_structs in
-    let accessors =
-      List.hd (Datatype.get_accessors (Expr.get_sort left))
-    in
-    List.map2
-      (fun (_, field_ty) accessor ->
-        semantic_value_equality ctx field_ty
-          (Expr.mk_app ctx.ctx_z3 accessor [left])
-          (Expr.mk_app ctx.ctx_z3 accessor [right]))
-      (StructField.Map.bindings fields) accessors
-    |> Boolean.mk_and ctx.ctx_z3
-  | TTuple tys ->
-    List.map2
-      (fun ty accessor ->
-        semantic_value_equality ctx ty
-          (Expr.mk_app ctx.ctx_z3 accessor [left])
-          (Expr.mk_app ctx.ctx_z3 accessor [right]))
-      tys (Tuple.get_field_decls (Expr.get_sort left))
-    |> Boolean.mk_and ctx.ctx_z3
-  | TOption payload_ty ->
-    begin match Datatype.get_recognizers (Expr.get_sort left),
-                Datatype.get_accessors (Expr.get_sort left) with
-    | absent :: present :: _, _absent_fields :: (payload :: _) :: _ ->
-      let is constructor value = Expr.mk_app ctx.ctx_z3 constructor [value] in
-      Boolean.mk_or ctx.ctx_z3
-        [ Boolean.mk_and ctx.ctx_z3 [is absent left; is absent right];
-          Boolean.mk_and ctx.ctx_z3
-            [ is present left; is present right;
-              semantic_value_equality ctx payload_ty
-                (Expr.mk_app ctx.ctx_z3 payload [left])
-                (Expr.mk_app ctx.ctx_z3 payload [right]) ] ]
-    | _ -> eq left right
-    end
-  | TEnum name ->
-    let constructors =
-      EnumConstructor.Map.bindings (EnumName.Map.find name ctx.ctx_decl.ctx_enums)
-    in
-    let recognizers = Datatype.get_recognizers (Expr.get_sort left) in
-    let accessors = Datatype.get_accessors (Expr.get_sort left) in
-    List.map2
-      (fun (_, payload_ty) (recognizer, fields) ->
-        let same_constructor =
-          Boolean.mk_and ctx.ctx_z3
-            [ Expr.mk_app ctx.ctx_z3 recognizer [left];
-              Expr.mk_app ctx.ctx_z3 recognizer [right] ]
-        in
-        match fields with
-        | payload :: _ ->
-          Boolean.mk_and ctx.ctx_z3
-            [ same_constructor;
-              semantic_value_equality ctx payload_ty
-                (Expr.mk_app ctx.ctx_z3 payload [left])
-                (Expr.mk_app ctx.ctx_z3 payload [right]) ]
-        | [] -> same_constructor)
-      constructors (List.combine recognizers accessors)
-    |> Boolean.mk_or ctx.ctx_z3
-  | TDefault payload_ty ->
-    begin match List.hd (Datatype.get_accessors (Expr.get_sort left)) with
-    | defined :: conflict :: payload :: _ ->
-      let field accessor value = Expr.mk_app ctx.ctx_z3 accessor [value] in
-      let left_defined = field defined left in
-      Boolean.mk_and ctx.ctx_z3
-        [ eq left_defined (field defined right);
-          eq (field conflict left) (field conflict right);
-          Boolean.mk_implies ctx.ctx_z3 left_defined
-            (semantic_value_equality ctx payload_ty
-               (field payload left) (field payload right)) ]
-    | _ -> eq left right
-    end
-  | TLit _ | TAbstract _ | TArrow _ | TVar _ | TForAll _ | TClosureEnv
-  | TError -> eq left right
+let encoding_complete session =
+  session.direct_complete && not !(session.direct_ctx.ctx_capacity_limited)
 
-let refine_last_input (session : direct_session) =
-  match session.direct_last_input with
-  | None -> ()
-  | Some value ->
-    let equivalent =
-      semantic_value_equality session.direct_ctx session.direct_input_ty
-        session.direct_input_expr value
-    in
-    Z3.Solver.add session.direct_solver
-      [Boolean.mk_not session.direct_ctx.ctx_z3 equivalent];
-    session.direct_last_input <- None
-
-let block_last_input = refine_last_input
+let encoding_statistics session =
+  `Assoc ["input_bound", `Int session.direct_ctx.ctx_symbolic_list_bound;
+          "array_capacity", `Int session.direct_ctx.ctx_max_list_length;
+          "pending_relations", `Int (Queue.length session.direct_ctx.ctx_pending_relations);
+          "value_summaries", `Int (Var.Map.cardinal session.direct_ctx.ctx_z3valuecache);
+          "call_summaries", `Int (Hashtbl.length session.direct_ctx.ctx_summary_cache);
+          "reachability_summaries", `Int (Hashtbl.length session.direct_compiled_definition_guards);
+          "deferred_failures", `Int (List.length session.direct_failures);
+          "asserted_constraints", `Int (Hashtbl.length session.direct_asserted_constraints);
+          "incomplete_reasons", `List (List.map (fun x -> `String x)
+            (List.sort_uniq String.compare session.direct_errors));
+          "complete", `Bool (encoding_complete session)]

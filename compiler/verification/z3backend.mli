@@ -27,6 +27,7 @@ type coverage_result =
   | Coverage_unknown of string
 
 val create_direct_session :
+  lazy_relations:bool ->
   Shared_ast.decl_ctx ->
   input_var:Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var ->
   input_ty:Shared_ast.typ ->
@@ -62,6 +63,7 @@ val reachable_objectives :
 val compile_objective :
   ?on_objective:(string -> unit) ->
   ?on_timing:(string -> float -> unit) ->
+  ?failure_locations:Catala_runtime.code_location list ->
   direct_session ->
   objective_of_tag:(Shared_ast.tag -> Catala_utils.Pos.t -> string option) ->
   definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
@@ -86,8 +88,21 @@ val solve_uncovered :
   string list ->
   coverage_result
 
-(** Conservatively refine after a failed replay by excluding the Catala-visible
-    input equivalence class. Invisible bounded-list padding and inactive sum
-    payloads are abstracted away, so one concrete counterexample is not retried
-    under a syntactically different Z3 model. *)
-val block_last_input : direct_session -> unit
+val refine_failure : direct_session -> Catala_runtime.code_location list -> int
+
+val required_array_capacity :
+  ?literals_only:bool ->
+  decl_ctx:Shared_ast.decl_ctx ->
+  input_ty:Shared_ast.typ ->
+  input_bound:int ->
+  input_var:Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var ->
+  definitions:(Shared_ast.typed Dcalc.Ast.naked_expr Bindlib.var *
+               Shared_ast.typed Dcalc.Ast.expr) list ->
+  Shared_ast.typed Dcalc.Ast.expr -> int
+
+val encoding_complete : direct_session -> bool
+val encoding_statistics : direct_session -> Yojson.Safe.t
+
+val refine_semantics : direct_session -> int
+
+val mark_capacity_limited : direct_session -> unit
