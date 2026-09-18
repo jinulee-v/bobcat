@@ -30,11 +30,6 @@ type item = {
 
 let libcatala = "libcatala"
 
-let catala_suffix_regex =
-  Re.(
-    compile
-      (seq [str ".catala_"; group (seq [alpha; alpha]); opt (str ".md"); eos]))
-
 let test_command_args =
   let open Re in
   let re =
@@ -54,8 +49,7 @@ let test_command_args =
     exec_opt re str |> Option.map (fun g -> String.trim (Re.Group.get g 1))
 
 let get_lang file =
-  Option.bind (Re.exec_opt catala_suffix_regex file)
-  @@ fun g -> List.assoc_opt (Re.Group.get g 1) Catala_utils.Cli.languages
+  List.assoc_opt (File.extension file) Catala_utils.Cli.extensions
 
 let rec find_test_scope ~lang file =
   (* Note: if efficiency becomes a problem, this could rely on a cached index of

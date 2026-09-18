@@ -1337,10 +1337,19 @@ let load_runtime_modules ~hashf prg =
               (dir / "ocaml" / ModuleName.to_string (ModuleName.normalise mname))
               ^ ".cmo")
         in
-        if Sys.file_exists f then f
-        else
-          let root = File.common_prefix Global.options.bin_dir dir in
+        let root = File.common_prefix Global.options.bin_dir dir in
+        let relocated =
           File.(Global.options.bin_dir / File.remove_prefix root f)
+        in
+        let uncapitalized file =
+          File.(dirname file / String.uncapitalize_ascii (basename file))
+        in
+        match
+          List.find_opt Sys.file_exists
+            [f; relocated; uncapitalized f; uncapitalized relocated]
+        with
+        | Some file -> file
+        | None -> relocated
       in
       (if not (Sys.file_exists obj_file) then
          Message.error

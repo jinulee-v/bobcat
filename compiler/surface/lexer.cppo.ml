@@ -824,11 +824,14 @@ let rec lex_code (lexbuf : lexbuf) : token =
   | lowercase, Star idchar ->
       (* Name of variable *)
       L.update_acc lexbuf;
-      LIDENT (Utf8.lexeme lexbuf)
+      let name = Utf8.lexeme lexbuf in
+      if name = "world" then UIDENT name else LIDENT name
   | uncased_idstart, Star idchar ->
       (* Variable name in a script without uppercase/lowercase distinctions. *)
       L.update_acc lexbuf;
-      LIDENT (Utf8.lexeme lexbuf)
+      let name = Utf8.lexeme lexbuf in
+      if name = "형법" || name = "교통사고처리특례법" || name = "형사소송법" || name = "특정범죄가중처벌법" || name = "형사판결연결" then UIDENT name
+      else LIDENT name
   | Opt '-', Plus digit ->
       (* Integer literal*)
       L.update_acc lexbuf;
@@ -977,7 +980,7 @@ let line_dir_arg_upcase_re =
   Re.(compile @@ seq [
       bos; char '>'; rep space; rep1 alpha;
       rep (alt [space; lower]); space;
-      group (seq [rep1 upper; rep (diff any space)]);
+      group (rep1 (diff any space));
       rep any;
       eol
     ])
@@ -1002,21 +1005,21 @@ let lex_line ~context (lexbuf : lexbuf) : (string * L.line_token) option =
           Some (str, LINE_INCLUDE file)
         with Not_found -> Some (str, LINE_ANY))
      | '>', Star hspace, MR_MODULE_DEF, Plus hspace,
-       uppercase, Star (Compl white_space), Plus hspace,
+       (uppercase | lowercase | uncased_idstart), Star (Compl white_space), Plus hspace,
        MR_EXTERNAL, Star hspace, (eol | eof)  ->
        let str = Utf8.lexeme lexbuf in
        (try
           let mdl = Re.Group.get (Re.exec line_dir_arg_upcase_re str) 1 in
           Some (str, LINE_MODULE_DEF (mdl, true))
         with Not_found -> Some (str, LINE_ANY))
-     | '>', Star hspace, MR_MODULE_DEF, Plus hspace, uppercase, Star any_but_eol,
+     | '>', Star hspace, MR_MODULE_DEF, Plus hspace, (uppercase | lowercase | uncased_idstart), Star any_but_eol,
        (eol | eof)  ->
        let str = Utf8.lexeme lexbuf in
        (try
           let mdl = Re.Group.get (Re.exec line_dir_arg_upcase_re str) 1 in
           Some (str, LINE_MODULE_DEF (mdl, false))
         with Not_found -> Some (str, LINE_ANY))
-     | '>', Star hspace, MR_MODULE_USE, Plus hspace, uppercase, Star (any_but_eol),
+     | '>', Star hspace, MR_MODULE_USE, Plus hspace, (uppercase | lowercase | uncased_idstart), Star (any_but_eol),
        (eol | eof)  ->
        let str = Utf8.lexeme lexbuf in
        (try

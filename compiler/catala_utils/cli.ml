@@ -50,6 +50,8 @@ let extensions =
     "catala_fr.md", `Fr;
     "catala_en", `En;
     "catala_en.md", `En;
+    "catala_ko", `En;
+    "catala_ko.md", `En;
     "catala_pl", `Pl;
     "catala_pl.md", `Pl;
   ]

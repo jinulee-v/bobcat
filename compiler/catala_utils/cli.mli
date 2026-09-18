@@ -22,6 +22,9 @@ val languages : (string * backend_lang) list
 val language_code : backend_lang -> string
 (** Returns the lowercase two-letter language code *)
 
+val extensions : (string * backend_lang) list
+(** Recognized source file extensions and their parser languages. *)
+
 val file_lang : file -> backend_lang
 (** Associates a file extension with its corresponding
     {!type: Global.backend_lang} string representation. *)

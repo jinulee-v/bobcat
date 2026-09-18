@@ -636,6 +636,8 @@ let extensions =
     ".catala_fr.md", "fr";
     ".catala_en", "en";
     ".catala_en.md", "en";
+    ".catala_ko", "en";
+    ".catala_ko.md", "en";
     ".catala_pl", "pl";
     ".catala_pl.md", "pl";
   ]

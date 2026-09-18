@@ -43,10 +43,25 @@ let to_id s =
   if s = "_" then s
   else
     let s =
-      Ubase.from_utf8 ~strip:"" s
-      |> map (function
-        | ('a' .. 'z' | 'A' .. 'Z' | '0' .. '9') as c -> c
-        | _ -> '_')
+      let b = Buffer.create (length s) in
+      utf8_seq s
+      |> Seq.iter (fun uchar ->
+             let codepoint = Uchar.to_int uchar in
+             let char = Buffer.create 4 in
+             Buffer.add_utf_8_uchar char uchar;
+             let transliterated =
+               Ubase.from_utf8 ~strip:"" (Buffer.contents char)
+             in
+             if codepoint >= 0x80 && transliterated = "" then
+               Buffer.add_string b (Printf.sprintf "_u%X_" codepoint)
+             else
+               iter
+                 (function
+                   | ('a' .. 'z' | 'A' .. 'Z' | '0' .. '9') as c ->
+                       Buffer.add_char b c
+                   | _ -> Buffer.add_char b '_')
+                 transliterated);
+      Buffer.contents b
     in
     if length s < 1 || get s 0 = '_' then
       let pfx = if begins_with_uppercase s then "X" else "x" in

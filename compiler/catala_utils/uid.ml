@@ -132,7 +132,10 @@ module Module = struct
       end)
       ()
 
-  let normalise t = map_info (Mark.map String.to_id) t
+  let normalise t =
+    map_info
+      (Mark.map (fun name -> String.capitalize_ascii (String.to_id name)))
+      t
 end
 
 module Path = struct

@@ -571,7 +571,11 @@ module Tree = struct
   let lookup t path =
     try
       let t = subtree t (dirname path) in
-      let fname = String.to_id (Filename.basename path) in
+      let basename = Filename.basename path in
+      match Map.find_opt basename (Lazy.force t) with
+      | Some (path, F) -> Some path
+      | Some (_, D _) | None ->
+      let fname = String.to_id basename in
       let matches =
         Map.filter_map
           (fun s m ->
